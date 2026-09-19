@@ -10,6 +10,8 @@ Catalog Error: Scalar Function with name openzl_decompress does not exist!
 
 require openzl
 
+require parquet
+
 # Missing input file should fail cleanly with our own error message,
 # regardless of whether the zli binary is available in this environment
 # (the missing-file check runs first).
@@ -22,3 +24,69 @@ statement error
 SELECT openzl_compress('/nonexistent/path/does/not/exist.parquet', '/tmp/openzl_test_out.zl');
 ----
 input parquet file not found
+
+# read_openzl(path) is a table macro around read_parquet(openzl_decompress(...)):
+# same missing-file error, surfacing through the macro expansion.
+statement error
+SELECT * FROM read_openzl('/nonexistent/path/does/not/exist.zl');
+----
+input file not found
+
+# Full round trip: write canonical parquet, archive it, read it back via the
+# single-call macro, and confirm it lands back on the original data.
+statement ok
+CREATE TABLE t AS SELECT range AS a, 'row_' || range AS b FROM range(1000);
+
+statement ok
+COPY t TO '__TEST_DIR__/openzl_roundtrip.parquet' (FORMAT PARQUET, COMPRESSION 'uncompressed', DICTIONARY_SIZE_LIMIT 0);
+
+statement ok
+SELECT openzl_compress('__TEST_DIR__/openzl_roundtrip.parquet', '__TEST_DIR__/openzl_roundtrip.zl');
+
+query II
+SELECT * FROM read_openzl('__TEST_DIR__/openzl_roundtrip.zl') ORDER BY a LIMIT 3;
+----
+0	row_0
+1	row_1
+2	row_2
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_roundtrip.zl');
+----
+1000
+
+# COPY ... TO 'x.zl' (FORMAT OPENZL) is the single-call write path: it
+# delegates to the catalog's "parquet" copy function under the hood (staged
+# canonically, then OpenZL-compressed on finalize), so this should produce
+# the same result as the COPY-then-openzl_compress path above.
+statement ok
+COPY t TO '__TEST_DIR__/openzl_copyfmt.zl' (FORMAT OPENZL);
+
+query II
+SELECT * FROM read_openzl('__TEST_DIR__/openzl_copyfmt.zl') ORDER BY a LIMIT 3;
+----
+0	row_0
+1	row_1
+2	row_2
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_copyfmt.zl');
+----
+1000
+
+# No leftover staging file after a successful COPY.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/openzl_copyfmt.zl.openzl_staging.parquet');
+----
+0
+
+# Overwriting an existing .zl target (exercises DuckDB's own
+# tmp-file-then-rename path, since the destination already exists) should
+# still produce a correct, non-stale result.
+statement ok
+COPY (SELECT * FROM t WHERE a < 5) TO '__TEST_DIR__/openzl_copyfmt.zl' (FORMAT OPENZL);
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_copyfmt.zl');
+----
+5

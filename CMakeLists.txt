@@ -45,20 +45,27 @@ set(EXTENSION_SOURCES src/openzl_extension.cpp src/openzl_bridge.cpp)
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+# DuckDB's own top-level CMakeLists.txt sets CMAKE_CXX_STANDARD 11 as a CACHE
+# variable (our own attempt to set it to 17 above is a no-op: a non-FORCE
+# cache set() never overwrites an existing cache entry, and DuckDB's own
+# top-level project is configured first). OpenZL's C++ headers require C++17
+# (poly::string_view/poly::optional silently degrade to bogus fallback types
+# otherwise) -- but ONLY src/openzl_bridge.cpp actually touches those headers.
+# Forcing C++17 on the whole extension target (via CXX_STANDARD) instead
+# broke the link: DuckDB's own sources see CopyFunctionCatalogEntry::Name (a
+# static constexpr member, implicitly `inline` under C++17 but not C++11) at
+# C++11, and a C++17 TU pulling in the same header via
+# copy_function_catalog_entry.hpp disagrees on its linkage, causing a
+# "multiple definition" link error. Scoping the flag to the one file that
+# needs it avoids the whole class of mismatch.
+set_source_files_properties(src/openzl_bridge.cpp PROPERTIES COMPILE_OPTIONS "-std=c++17")
+
 foreach(TGT ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
   target_include_directories(${TGT} PRIVATE
     third_party/openzl/include
     third_party/openzl/cpp/include
     third_party/openzl)
   target_link_libraries(${TGT} openzl openzl_cpp parquet_graph shared_components)
-  # DuckDB's own top-level CMakeLists.txt sets CMAKE_CXX_STANDARD 11 as a
-  # CACHE variable (our own attempt to set it to 17 above is a no-op: a
-  # non-FORCE cache set() never overwrites an existing cache entry, and
-  # DuckDB's own top-level project is configured first). OpenZL's C++
-  # headers require C++17 (poly::string_view/poly::optional silently
-  # degrade to bogus fallback types otherwise), so force it as a target
-  # property, which does take precedence over the global default.
-  set_target_properties(${TGT} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 endforeach()
 
 # No install(EXPORT ...) here: exporting the static extension target would

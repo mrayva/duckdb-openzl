@@ -57,19 +57,41 @@ That keeps Arrow out of this project's dependency graph entirely.
 ```sql
 LOAD 'openzl';
 
--- Decompress an OpenZL archive back into a plain, queryable parquet file.
-SELECT openzl_decompress('data.zl', 'data.parquet');
-SELECT * FROM read_parquet('data.parquet');
+-- Single-call write: canonicalizes (via the catalog's own "parquet" copy
+-- function, staged to a sibling temp file) and OpenZL-compresses in one COPY.
+COPY tbl TO 'data.zl' (FORMAT OPENZL);
 
+-- Single-call read: decompresses to a sibling .parquet file and reads it.
+SELECT * FROM read_openzl('data.zl');
+```
+
+Lower-level, two-step equivalents are also available (what `FORMAT OPENZL` and
+`read_openzl` are built on top of), useful when you want to control the
+intermediate parquet file's location or inspect it directly:
+
+```sql
 -- Write already-canonical parquet, then OpenZL-compress it.
 -- Does not delete the source.
 COPY tbl TO 'staging.parquet'
   (FORMAT PARQUET, COMPRESSION 'uncompressed', DICTIONARY_SIZE_LIMIT 0);
 SELECT openzl_compress('staging.parquet', 'data.zl');
+
+-- Decompress an OpenZL archive back into a plain, queryable parquet file.
+SELECT openzl_decompress('data.zl', 'data.parquet');
+SELECT * FROM read_parquet('data.parquet');
 ```
 
-Both functions return their output path on success and throw an `IOException`
-on failure (missing input, input not canonical, OpenZL error, etc).
+All four throw an `IOException` on failure (missing input, input not
+canonical, OpenZL error, etc). `read_openzl` and `openzl_decompress` write
+their decompressed `.parquet` file to a deterministic sibling path (stripping
+a trailing `.zl`, or appending `.parquet`) rather than a fresh temp file per
+call: repeat calls reuse/overwrite it instead of accumulating files on disk,
+which matters given how often disk space has been this project's actual
+constraint. That means concurrent calls against the *same* archive path race
+on that sibling file -- fine for the single-user/analytical use this
+extension targets, but worth knowing. `COPY ... (FORMAT OPENZL)` cleans up
+its own intermediate staging file (`<path>.openzl_staging.parquet`)
+unconditionally, including on error.
 
 ## How native linking works
 
@@ -102,10 +124,16 @@ Two build gotchas worth knowing if you touch this again:
   overwrites an existing entry, so ours was silently ignored. OpenZL's C++
   headers require C++17 (`poly::string_view`/`poly::optional` silently
   degrade to bogus fallback types under C++11 with no compile error until
-  you try to call something). Fixed via
-  `set_target_properties(... PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)`
-  directly on the extension targets, which *does* override the global
-  default.
+  you try to call something), but only `src/openzl_bridge.cpp` touches them.
+  Forcing C++17 on the *whole extension target* (via `CXX_STANDARD`) builds
+  fine but fails to **link**: `duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp`
+  declares `static constexpr const char *Name`, which is implicitly `inline`
+  under C++17 but not C++11 -- compiling `openzl_extension.cpp` (which needs
+  that header for the `COPY ... FORMAT OPENZL` support below) at a different
+  standard than the rest of DuckDB disagrees on that symbol's linkage,
+  producing a "multiple definition" error at final link time. Fixed by
+  scoping the flag to only the one file that needs it:
+  `set_source_files_properties(src/openzl_bridge.cpp PROPERTIES COMPILE_OPTIONS "-std=c++17")`.
 - DuckDB's build adds its own (older) vendored `zstd/include` to the
   directory-scoped include path, inherited by everything added via
   `add_subdirectory` afterward -- including OpenZL's. Left alone, OpenZL's C
@@ -115,11 +143,38 @@ Two build gotchas worth knowing if you touch this again:
   `include_directories(BEFORE third_party/openzl/deps/zstd/lib)` before
   `add_subdirectory(third_party/openzl ...)`.
 
+## How the ergonomics functions work
+
+- `read_openzl(path)` is a DuckDB table macro (`DefaultTableFunctionGenerator::CreateTableMacroInfo`),
+  registered in C++ rather than via a SQL string executed at load time. Its
+  body is literally `SELECT * FROM read_parquet(openzl_decompress(path, ...))`
+  -- it doesn't need a dedicated table function implementation, just macro
+  expansion over the two functions that already existed.
+- `COPY ... (FORMAT OPENZL)` is a real `CopyFunction`, but it doesn't
+  reimplement a parquet writer: its bind looks up the catalog's own
+  registered `"parquet"` `CopyFunctionCatalogEntry`
+  (`Catalog::GetEntry<CopyFunctionCatalogEntry>`), copies out its
+  `CopyFunction` struct (forcing `compression=uncompressed`,
+  `dictionary_size_limit=0` in the `CopyInfo` passed to *its* bind), and then
+  forwards every `copy_to_initialize_global/local/sink/combine` call straight
+  through to parquet's own function pointers, writing into a staging file
+  next to the real destination (`<path>.openzl_staging.parquet`). Only
+  `copy_to_finalize` differs: after letting parquet's own finalize close out
+  the staging file, it OpenZL-compresses that file into the real destination
+  and deletes it. `execution_mode` is left null, which defaults to
+  `REGULAR_COPY_TO_FILE` -- the same single-threaded bind/sink/combine/finalize
+  sequence every simple copy function supports, regardless of what other
+  parallel/batch modes parquet's own copy function also implements.
+- The real destination passed to `copy_to_initialize_global` is whatever
+  DuckDB's planner decided it should be for this run -- which may itself be a
+  `tmp_`-prefixed sibling that DuckDB renames into place after we return
+  successfully, when the true target file already exists (`use_tmp_file`).
+  Reading that argument at `copy_to_initialize_global` time rather than
+  capturing the user's literal path at bind time makes overwriting an
+  existing `.zl` archive behave correctly too.
+
 ## Deliberately not yet implemented
 
-- **Ergonomics**: a single `read_openzl('data.zl')` table function/macro
-  instead of the current two-step `read_parquet(openzl_decompress(...))`, and
-  a real `COPY tbl TO 'data.zl' (FORMAT OPENZL)` handler.
 - **A Postgres extension** reusing `openzl_bridge.{hpp,cpp}` as-is.
 
 ## Building
