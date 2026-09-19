@@ -1,101 +1,80 @@
 #include "openzl_bridge.hpp"
 
-#include <array>
-#include <cstdio>
-#include <cstdlib>
+#include <fstream>
 #include <sstream>
-#include <sys/stat.h>
-#include <sys/wait.h>
+
+#include "openzl/cpp/CCtx.hpp"
+#include "openzl/cpp/CParam.hpp"
+#include "openzl/cpp/Compressor.hpp"
+#include "openzl/cpp/DCtx.hpp"
+#include "openzl/cpp/Exception.hpp"
+#include "openzl/zl_version.h"
+
+#include "custom_parsers/parquet/parquet_graph.h"
+#include "custom_parsers/shared_components/clustering.h"
 
 namespace openzl_bridge {
 
 namespace {
 
-std::string GetEnvOr(const char *name, const std::string &fallback) {
-	const char *value = std::getenv(name);
-	if (value != nullptr && value[0] != '\0') {
-		return std::string(value);
-	}
-	return fallback;
-}
-
-std::string HomeDir() {
-	return GetEnvOr("HOME", "/root");
-}
-
 bool FileExists(const std::string &path) {
-	struct stat st{};
-	return ::stat(path.c_str(), &st) == 0;
+	std::ifstream f(path, std::ios::binary);
+	return f.good();
 }
 
-bool IsExecutable(const std::string &path) {
-	struct stat st{};
-	if (::stat(path.c_str(), &st) != 0) {
-		return false;
+std::string ReadFile(const std::string &path) {
+	std::ifstream f(path, std::ios::binary);
+	if (!f) {
+		throw Error("openzl_bridge: could not open file for reading: " + path);
 	}
-	return (st.st_mode & S_IXUSR) != 0;
+	std::ostringstream ss;
+	ss << f.rdbuf();
+	if (f.bad()) {
+		throw Error("openzl_bridge: error reading file: " + path);
+	}
+	return ss.str();
 }
 
-// Runs `command`, capturing combined stdout+stderr for error reporting.
-// Throws openzl_bridge::Error if the command exits non-zero.
-void RunOrThrow(const std::string &command, const std::string &action_description) {
-	std::string full_command = command + " 2>&1";
-	std::array<char, 4096> buffer{};
-	std::ostringstream output;
-
-	FILE *pipe = popen(full_command.c_str(), "r");
-	if (pipe == nullptr) {
-		throw Error("Failed to launch subprocess for: " + action_description);
+void WriteFile(const std::string &path, const std::string &contents) {
+	std::ofstream f(path, std::ios::binary | std::ios::trunc);
+	if (!f) {
+		throw Error("openzl_bridge: could not open file for writing: " + path);
 	}
-	size_t bytes_read;
-	while ((bytes_read = fread(buffer.data(), 1, buffer.size(), pipe)) > 0) {
-		output.write(buffer.data(), static_cast<std::streamsize>(bytes_read));
-	}
-	int status = pclose(pipe);
-	if (status != 0) {
-		std::ostringstream msg;
-		msg << "openzl_bridge: " << action_description << " failed (exit status " << status << "): " << command
-		    << "\n"
-		    << output.str();
-		throw Error(msg.str());
+	f.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+	if (!f) {
+		throw Error("openzl_bridge: error writing file: " + path);
 	}
 }
 
-std::string ShellQuote(const std::string &s) {
-	std::string out = "'";
-	for (char c : s) {
-		if (c == '\'') {
-			out += "'\\''";
-		} else {
-			out += c;
-		}
-	}
-	out += "'";
-	return out;
+// Builds the "parquet" compression graph (canonical parquet bytes in,
+// OpenZL-compressed bytes out): a generic clustering successor feeding the
+// parquet-aware graph, matching what `zli --profile parquet` builds
+// internally (see facebook/openzl cli/utils/compress_profiles.cpp). No
+// chunking -- our files are already modestly sized per-table Parquet exports.
+openzl::Compressor BuildParquetCompressor() {
+	openzl::Compressor compressor;
+	ZL_Compressor *comp = compressor.get();
+	ZL_GraphID clustering = ZS2_createGraph_genericClustering(comp);
+	ZL_GraphID parquet_graph = ZL_Parquet_registerGraph(comp, clustering);
+	compressor.selectStartingGraph(parquet_graph);
+	return compressor;
 }
 
 } // namespace
-
-std::string ZliBinPath() {
-	return GetEnvOr("OPENZL_ZLI_BIN", HomeDir() + "/openzl/zli");
-}
 
 void Decompress(const std::string &input_path, const std::string &output_path) {
 	if (!FileExists(input_path)) {
 		throw Error("openzl_bridge: input file not found: " + input_path);
 	}
-	std::string zli = ZliBinPath();
-	if (!IsExecutable(zli)) {
-		throw Error("openzl_bridge: zli binary not found or not executable: " + zli +
-		            " (set OPENZL_ZLI_BIN)");
-	}
-
-	std::string command = ShellQuote(zli) + " decompress " + ShellQuote(input_path) + " -o " +
-	                       ShellQuote(output_path) + " -f";
-	RunOrThrow(command, "decompress " + input_path);
-
-	if (!FileExists(output_path)) {
-		throw Error("openzl_bridge: decompress reported success but output is missing: " + output_path);
+	try {
+		std::string input = ReadFile(input_path);
+		openzl::DCtx dctx;
+		std::string output = dctx.decompressSerial(input);
+		WriteFile(output_path, output);
+	} catch (const Error &) {
+		throw;
+	} catch (const std::exception &e) {
+		throw Error(std::string("openzl_bridge: decompress failed for ") + input_path + ": " + e.what());
 	}
 }
 
@@ -103,18 +82,23 @@ void CompressParquet(const std::string &input_parquet_path, const std::string &o
 	if (!FileExists(input_parquet_path)) {
 		throw Error("openzl_bridge: input parquet file not found: " + input_parquet_path);
 	}
-	std::string zli = ZliBinPath();
-	if (!IsExecutable(zli)) {
-		throw Error("openzl_bridge: zli binary not found or not executable: " + zli +
-		            " (set OPENZL_ZLI_BIN)");
-	}
-
-	std::string compress_command = ShellQuote(zli) + " compress " + ShellQuote(input_parquet_path) +
-	                                " --profile parquet -o " + ShellQuote(output_zl_path) + " -f";
-	RunOrThrow(compress_command, "compress " + input_parquet_path);
-
-	if (!FileExists(output_zl_path)) {
-		throw Error("openzl_bridge: compress reported success but output is missing: " + output_zl_path);
+	try {
+		std::string input = ReadFile(input_parquet_path);
+		openzl::Compressor compressor = BuildParquetCompressor();
+		openzl::CCtx cctx;
+		// zli's CLI sets this implicitly to the newest format the linked
+		// OpenZL build supports; we must set it explicitly when driving the
+		// C++ API directly, or compression fails with "Format version is not
+		// set" (ZL_CParam_formatVersion, gcparams.c).
+		cctx.setParameter(openzl::CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+		cctx.refCompressor(compressor);
+		std::string output = cctx.compressSerial(input);
+		WriteFile(output_zl_path, output);
+	} catch (const Error &) {
+		throw;
+	} catch (const std::exception &e) {
+		throw Error(std::string("openzl_bridge: compress failed for ") + input_parquet_path +
+		            " (is it canonical parquet? uncompressed, plain-encoded, no dictionary): " + e.what());
 	}
 }
 

@@ -6,19 +6,22 @@ Parquet files.
 
 This repository is based on https://github.com/duckdb/extension-template.
 
-## Status: proof of concept
+## Status: native-linked
 
-The current implementation shells out to the `zli` CLI tool from a local
-OpenZL build, rather than linking OpenZL's C++ library directly. This mirrors
-how the `wireduck` extension shells out to `tshark` rather than linking
-libwireshark.
+`src/openzl_bridge.{hpp,cpp}` links OpenZL's C++ library directly
+(`openzl::CCtx` / `openzl::DCtx` / `openzl::Compressor`, plus the "parquet"
+graph builders from OpenZL's `custom_parsers`) -- there is no runtime
+dependency on the `zli` CLI binary or any subprocess call. OpenZL is vendored
+as a git submodule (`third_party/openzl`) and built as part of this
+extension's own CMake configuration.
 
-The compress/decompress logic lives entirely in `src/openzl_bridge.{hpp,cpp}`,
-which has **no DuckDB dependency** on purpose: the same translation unit is
-meant to be reusable as-is by a future Postgres extension. A later iteration
-can swap the bridge's *implementation* to call OpenZL's C++ API directly
-(`openzl::CCtx` / `openzl::DCtx`) without changing any caller, since the
-callers only see `openzl_bridge::Decompress(...)` / `CompressParquet(...)`.
+The bridge has **no DuckDB dependency** on purpose: the same translation unit
+is meant to be reusable as-is by a future Postgres extension. Callers only
+see `openzl_bridge::Decompress(...)` / `CompressParquet(...)`.
+
+(An earlier revision of this extension shelled out to the `zli` CLI tool as a
+proof of concept, mirroring how the `wireduck` extension shells out to
+`tshark`. See git history if that's of interest -- it's been fully replaced.)
 
 ## Why this shape
 
@@ -28,8 +31,8 @@ OpenZL-compressed column chunk inside a real `.parquet` file. Instead,
 OpenZL's `parquet` profile takes a *canonicalized* (decoded: uncompressed,
 plain-encoded) parquet file's bytes and produces a separate `.zl` archive in
 its own container format. That `.zl` file is not a valid parquet file, but
-decompressing it (`zli decompress`) yields the canonical bytes back, which
-*are* directly valid, queryable parquet -- no re-encoding step needed.
+decompressing it yields the canonical bytes back, which *are* directly valid,
+queryable parquet -- no re-encoding step needed.
 
 So this extension wraps rather than replaces Parquet: compress a `.parquet`
 file down to a much smaller `.zl` archive for storage, decompress it back to
@@ -37,19 +40,17 @@ a `.parquet` file whenever you actually need to query it.
 
 **Canonicalization is DuckDB's job, not this extension's.** OpenZL's `parquet`
 profile only accepts *canonical* parquet: uncompressed, plain-encoded, no
-dictionary pages. Rather than shelling out to Arrow's `make_canonical_parquet`
-tool (which drags in Arrow/Parquet/Thrift/Snappy as a build dependency),
-DuckDB's own Parquet writer can produce this form directly -- verified
-byte-for-byte round-trip correct against real project data:
+dictionary pages. Rather than linking Arrow's `make_canonical_parquet` tool
+(which drags in Arrow/Parquet/Thrift/Snappy as a dependency), DuckDB's own
+Parquet writer produces this form directly -- verified byte-for-byte
+round-trip correct against real project data:
 
 ```sql
 COPY tbl TO 'staging.parquet'
   (FORMAT PARQUET, COMPRESSION 'uncompressed', DICTIONARY_SIZE_LIMIT 0);
 ```
 
-That removes Arrow from this project's dependency graph entirely -- no
-canonicalization tool needed at build time or runtime, either in this POC or
-in a future native-linked version.
+That keeps Arrow out of this project's dependency graph entirely.
 
 ## Functions
 
@@ -68,43 +69,57 @@ SELECT openzl_compress('staging.parquet', 'data.zl');
 ```
 
 Both functions return their output path on success and throw an `IOException`
-on failure (missing input, missing OpenZL binary, non-zero subprocess exit,
-input not canonical, etc).
+on failure (missing input, input not canonical, OpenZL error, etc).
 
-### Configuring the OpenZL binary path
+## How native linking works
 
-By default the bridge looks for `zli` at `$HOME/openzl/zli`. Override with
-the `OPENZL_ZLI_BIN` environment variable if your OpenZL build lives
-elsewhere.
+- Building the "parquet" compression graph only needs
+  `ZS2_createGraph_genericClustering` (`custom_parsers/shared_components`)
+  and `ZL_Parquet_registerGraph` (`custom_parsers/parquet/parquet_graph.h`)
+  -- both plain C APIs whose libraries (`shared_components`, `parquet_graph`)
+  depend only on core `openzl`, not on the CLI's `tools/arg`
+  argument-parsing machinery (`cli/utils/compress_profiles.cpp`, where
+  `zli`'s `--profile parquet` flag is wired up, is a separate `utils`
+  library that this extension does not link).
+- Compression: build an `openzl::Compressor`, call the two functions above to
+  register the graph, `selectStartingGraph`, then create an `openzl::CCtx`,
+  set `CParam::FormatVersion` to `ZL_MAX_FORMAT_VERSION` (required when
+  driving the C++ API directly -- `zli`'s CLI sets this implicitly), and call
+  `compressSerial(bytes)`.
+- Decompression: `openzl::DCtx().decompressSerial(bytes)` -- self-describing,
+  no profile/graph/format-version setup needed on the way back.
+- CMakeLists.txt vendors OpenZL via `add_subdirectory(third_party/openzl)`
+  with everything except `OPENZL_BUILD_CPP`/`OPENZL_BUILD_CUSTOM_PARSERS`
+  turned off (no CLI, no generic tools, no tests, no parquet-tools/Arrow),
+  and links only `openzl` + `openzl_cpp` + `parquet_graph` +
+  `shared_components` -- all in-tree OpenZL static libs, no Arrow, no
+  `ExternalProject_Add`, no CLI arg-parser.
+
+Two build gotchas worth knowing if you touch this again:
+- DuckDB's own top-level `CMakeLists.txt` pins `CMAKE_CXX_STANDARD` to `11`
+  as a CACHE variable, which is set *before* this extension's own
+  (non-`FORCE`) attempt to set it to `17` -- a plain cache `set()` never
+  overwrites an existing entry, so ours was silently ignored. OpenZL's C++
+  headers require C++17 (`poly::string_view`/`poly::optional` silently
+  degrade to bogus fallback types under C++11 with no compile error until
+  you try to call something). Fixed via
+  `set_target_properties(... PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)`
+  directly on the extension targets, which *does* override the global
+  default.
+- DuckDB's build adds its own (older) vendored `zstd/include` to the
+  directory-scoped include path, inherited by everything added via
+  `add_subdirectory` afterward -- including OpenZL's. Left alone, OpenZL's C
+  sources resolved `#include "zstd.h"` to DuckDB's copy instead of its own,
+  missing symbols DuckDB's older/partial vendored copy doesn't declare
+  (`ZSTD_reset_session_and_parameters`, etc). Fixed with
+  `include_directories(BEFORE third_party/openzl/deps/zstd/lib)` before
+  `add_subdirectory(third_party/openzl ...)`.
 
 ## Deliberately not yet implemented
 
 - **Ergonomics**: a single `read_openzl('data.zl')` table function/macro
   instead of the current two-step `read_parquet(openzl_decompress(...))`, and
   a real `COPY tbl TO 'data.zl' (FORMAT OPENZL)` handler.
-- **Native linking**: replacing the subprocess calls in `openzl_bridge.cpp`
-  with direct calls into OpenZL's C++ library, removing the runtime dependency
-  on the `zli` binary being present on `$PATH`/`$HOME`. Investigated the
-  dependency shape in OpenZL's own tree (`~/openzl`) and confirmed this is
-  lightweight, now that canonicalization is DuckDB's job (see above) rather
-  than something this extension needs to link:
-  - Building the "parquet" compression graph only needs
-    `ZS2_createGraph_genericClustering` (`custom_parsers/shared_components`)
-    and `ZL_Parquet_registerGraph_withChunkSize`
-    (`custom_parsers/parquet/parquet_graph.h`) -- both plain C APIs whose
-    libraries (`shared_components`, `parquet_graph`) depend only on core
-    `openzl`, not on the CLI's `tools/arg` argument-parsing machinery
-    (`cli/utils/compress_profiles.cpp`, where `zli`'s `--profile parquet`
-    flag is wired up, is a separate `utils` library and does NOT need to be
-    linked -- it just glues the two calls above to CLI flags).
-  - Compression: build an `openzl::Compressor`, call the two functions above
-    to register the graph, `selectStartingGraph`, then
-    `openzl::CCtx::refCompressor(compressor).compressSerial(bytes)`.
-  - Decompression: `openzl::DCtx().decompressSerial(bytes)` -- self-describing,
-    no profile/graph setup needed on the way back.
-  - Net result: native linking pulls in only `openzl` + `openzl_cpp` +
-    `parquet_graph` + `shared_components`, all in-tree OpenZL static libs.
-    No Arrow, no `ExternalProject_Add`, no CLI arg-parser.
 - **A Postgres extension** reusing `openzl_bridge.{hpp,cpp}` as-is.
 
 ## Building

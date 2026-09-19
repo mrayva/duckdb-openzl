@@ -6,3 +6,6 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
 	branch = main
+[submodule "third_party/openzl"]
+	path = third_party/openzl
+	url = https://github.com/facebook/openzl.git

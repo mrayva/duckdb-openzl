@@ -1,15 +1,15 @@
 // Copyright (c) 2026.
 //
 // This header has no dependency on DuckDB (or any other host database) on
-// purpose: it wraps the OpenZL CLI tool (zli) as plain C++ functions, so the
-// exact same translation unit can be reused as-is by a future Postgres
+// purpose: it wraps OpenZL's compression graph as plain C++ functions, so
+// the exact same translation unit can be reused as-is by a future Postgres
 // extension (or anything else) without having to re-implement the
-// shell-out/error-handling logic.
+// graph-construction/error-handling logic.
 //
-// Today this shells out to the zli binary built from
-// https://github.com/facebook/openzl. A later iteration can swap the
-// *implementation* of these functions to link OpenZL's C++ library directly
-// (openzl::CCtx / openzl::DCtx) without changing any caller.
+// Links OpenZL's C++ library directly (openzl::CCtx / openzl::DCtx, plus the
+// "parquet" graph builders from OpenZL's custom_parsers) rather than
+// shelling out to the `zli` CLI -- see git history for the earlier subprocess
+// based proof of concept.
 #pragma once
 
 #include <stdexcept>
@@ -17,17 +17,12 @@
 
 namespace openzl_bridge {
 
-// Thrown on any failure (binary not found, non-zero exit, etc). The message
-// is meant to be shown directly to the end user (e.g. re-thrown as a
-// DuckDB/Postgres error).
+// Thrown on any failure (missing input, malformed/non-canonical input,
+// OpenZL error, I/O error, etc). The message is meant to be shown directly
+// to the end user (e.g. re-thrown as a DuckDB/Postgres error).
 struct Error : std::runtime_error {
 	using std::runtime_error::runtime_error;
 };
-
-// Path to the zli CLI tool. Defaults to where this project's own build
-// places it, and can be overridden via the OPENZL_ZLI_BIN environment
-// variable.
-std::string ZliBinPath();
 
 // Decompresses an OpenZL archive (.zl) at `input_path` into `output_path`.
 // Since the OpenZL "parquet" profile compresses a *canonical* (uncompressed,
