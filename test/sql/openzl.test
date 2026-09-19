@@ -11,8 +11,8 @@ Catalog Error: Scalar Function with name openzl_decompress does not exist!
 require openzl
 
 # Missing input file should fail cleanly with our own error message,
-# regardless of whether the zli/make_canonical_parquet binaries are
-# available in this environment (the missing-file check runs first).
+# regardless of whether the zli binary is available in this environment
+# (the missing-file check runs first).
 statement error
 SELECT openzl_decompress('/nonexistent/path/does/not/exist.zl', '/tmp/openzl_test_out.parquet');
 ----
