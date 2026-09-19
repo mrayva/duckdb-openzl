@@ -1,0 +1,24 @@
+# name: test/sql/openzl.test
+# description: test openzl extension
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT openzl_decompress('a.zl', 'a.parquet');
+----
+Catalog Error: Scalar Function with name openzl_decompress does not exist!
+
+require openzl
+
+# Missing input file should fail cleanly with our own error message,
+# regardless of whether the zli/make_canonical_parquet binaries are
+# available in this environment (the missing-file check runs first).
+statement error
+SELECT openzl_decompress('/nonexistent/path/does/not/exist.zl', '/tmp/openzl_test_out.parquet');
+----
+input file not found
+
+statement error
+SELECT openzl_compress('/nonexistent/path/does/not/exist.parquet', '/tmp/openzl_test_out.zl');
+----
+input parquet file not found
