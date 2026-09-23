@@ -84,15 +84,32 @@ struct TrainOptions {
 	bool verbose = false;
 };
 
+// One trained candidate: the serialized compressor bytes (always populated),
+// and the file path it was written to ("" if `output_path` was empty --
+// i.e. the caller only wants the bytes, to store wherever it likes, e.g. as
+// a BLOB column in a DuckDB table, rather than as a standalone file).
+struct TrainedOutput {
+	std::string path;
+	std::string compressor_bytes;
+};
+
 // Trains a compressor against `sample_paths` (canonical parquet files sharing
-// the target table's schema) and writes the result(s) under `output_path`:
-//   - pareto_frontier=false (default): writes exactly `output_path`.
-//   - pareto_frontier=true: writes `output_path.0`, `output_path.1`, ...,
-//     ordered best-ratio-first, and returns all of their paths.
-// Returns the list of paths actually written (always non-empty on success).
-// Throws openzl_bridge::Error on failure (no samples, unreadable sample,
-// non-canonical sample, training internal error, I/O error writing output).
-std::vector<std::string> Train(const std::vector<std::string> &sample_paths, const std::string &output_path,
-                                const TrainOptions &opts);
+// the target table's schema).
+//
+// `output_path` controls on-disk persistence ("outside the database"):
+//   - non-empty, pareto_frontier=false (default): writes exactly `output_path`.
+//   - non-empty, pareto_frontier=true: writes `output_path.0`, `output_path.1`,
+//     ..., ordered best-ratio-first.
+//   - empty: writes nothing -- every TrainedOutput.compressor_bytes is still
+//     populated, for the caller to persist however it wants instead (e.g.
+//     "inside the database", as a BLOB column alongside the data it
+//     compresses -- see CompressParquetWithCompressorBytes() in
+//     openzl_bridge.hpp for the matching read-back path).
+// Returns one TrainedOutput per candidate (always exactly one unless
+// pareto_frontier=true). Throws openzl_bridge::Error on failure (no samples,
+// unreadable sample, non-canonical sample, training internal error, I/O
+// error writing output).
+std::vector<TrainedOutput> Train(const std::vector<std::string> &sample_paths, const std::string &output_path,
+                                  const TrainOptions &opts);
 
 } // namespace openzl_bridge

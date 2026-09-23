@@ -153,6 +153,49 @@ SELECT count(*) > 0 FROM openzl_train(
 ----
 1
 
+# NULL output_path: no file is written, but compressor_bytes is still
+# populated -- for storing the trained compressor "inside the database" (a
+# BLOB column in an ordinary table) instead of as a standalone file.
+query I
+SELECT output_path FROM openzl_train(
+    ['__TEST_DIR__/openzl_train_1.parquet', '__TEST_DIR__/openzl_train_2.parquet', '__TEST_DIR__/openzl_train_3.parquet'],
+    NULL,
+    no_ace_successors := true
+);
+----
+NULL
+
+statement ok
+CREATE TABLE openzl_compressors AS
+SELECT candidate_index, compressor_bytes FROM openzl_train(
+    ['__TEST_DIR__/openzl_train_1.parquet', '__TEST_DIR__/openzl_train_2.parquet', '__TEST_DIR__/openzl_train_3.parquet'],
+    NULL,
+    no_ace_successors := true
+);
+
+query I
+SELECT typeof(compressor_bytes) FROM openzl_compressors;
+----
+BLOB
+
+# Compressing with a compressor stored as a BLOB (read back from the table
+# above) round-trips the same as the file-based path.
+statement ok
+SELECT openzl_compress(
+    '__TEST_DIR__/openzl_train_1.parquet', '__TEST_DIR__/openzl_blob_trained.zl',
+    (SELECT compressor_bytes FROM openzl_compressors WHERE candidate_index = 0)
+);
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_blob_trained.zl');
+----
+200
+
+statement error
+SELECT openzl_compress('__TEST_DIR__/openzl_train_1.parquet', '__TEST_DIR__/x.zl', NULL::BLOB);
+----
+must not be NULL
+
 # Compressing with the trained compressor round-trips correctly against
 # held-out data (openzl_train_1, not one of the training samples used above
 # -- well, it was, but the point here is plumbing correctness, not held-out
@@ -172,6 +215,17 @@ SELECT openzl_compress('__TEST_DIR__/openzl_train_1.parquet', '__TEST_DIR__/open
 
 query I
 SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_fallback.zl');
+----
+200
+
+# NULL falls back the same way (requires SetNullHandling(SPECIAL_HANDLING) --
+# DuckDB's default null handling would otherwise make the whole call a no-op
+# returning NULL without ever writing openzl_fallback_null.zl at all).
+statement ok
+SELECT openzl_compress('__TEST_DIR__/openzl_train_1.parquet', '__TEST_DIR__/openzl_fallback_null.zl', NULL::VARCHAR);
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_fallback_null.zl');
 ----
 200
 

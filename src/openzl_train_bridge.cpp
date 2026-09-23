@@ -77,8 +77,8 @@ std::string NumberedPath(const std::string &output_path, size_t i) {
 
 } // namespace
 
-std::vector<std::string> Train(const std::vector<std::string> &sample_paths, const std::string &output_path,
-                                const TrainOptions &opts) {
+std::vector<TrainedOutput> Train(const std::vector<std::string> &sample_paths, const std::string &output_path,
+                                  const TrainOptions &opts) {
 	if (sample_paths.empty()) {
 		throw Error("openzl_bridge: Train() requires at least one sample file");
 	}
@@ -150,22 +150,32 @@ std::vector<std::string> Train(const std::vector<std::string> &sample_paths, con
 			throw Error("openzl_bridge: training produced no candidates");
 		}
 
-		std::vector<std::string> output_paths;
+		std::vector<TrainedOutput> outputs;
 		if (!opts.pareto_frontier) {
 			if (candidates.size() != 1) {
 				throw Error("openzl_bridge: non-Pareto training produced " + std::to_string(candidates.size()) +
 				            " candidates, expected 1");
 			}
-			WriteFile(output_path, candidates[0].serializedCompressor);
-			output_paths.push_back(output_path);
+			TrainedOutput out;
+			out.compressor_bytes = std::move(candidates[0].serializedCompressor);
+			if (!output_path.empty()) {
+				WriteFile(output_path, out.compressor_bytes);
+				out.path = output_path;
+			}
+			outputs.push_back(std::move(out));
 		} else {
 			for (size_t i = 0; i < candidates.size(); ++i) {
-				std::string path = NumberedPath(output_path, i);
-				WriteFile(path, candidates[i].serializedCompressor);
-				output_paths.push_back(path);
+				TrainedOutput out;
+				out.compressor_bytes = std::move(candidates[i].serializedCompressor);
+				if (!output_path.empty()) {
+					std::string path = NumberedPath(output_path, i);
+					WriteFile(path, out.compressor_bytes);
+					out.path = path;
+				}
+				outputs.push_back(std::move(out));
 			}
 		}
-		return output_paths;
+		return outputs;
 	} catch (const Error &) {
 		throw;
 	} catch (const std::exception &e) {

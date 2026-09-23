@@ -95,19 +95,30 @@ unconditionally, including on error.
 
 `openzl_compress` and `COPY ... FORMAT OPENZL` both take an optional trained
 compressor (see [Training](#training) below) and an explicit compression
-level:
+level. The trained compressor can be given either as a file path (a
+compressor kept "outside the database") or, for `openzl_compress` only, as a
+`BLOB` (a compressor kept "inside the database" -- see below):
 
 ```sql
 -- 2-arg: generic graph, compression level 9 (the default).
 SELECT openzl_compress('staging.parquet', 'data.zl');
--- 3-arg: compress with a compressor produced by openzl_train().
+-- 3-arg: compress with a compressor produced by openzl_train(), as a file path.
 SELECT openzl_compress('staging.parquet', 'data.zl', 'nbbo.compressor');
--- 4-arg: trained compressor + explicit level (1-9). '' for the trained-
--- compressor argument falls back to the generic graph.
+-- 4-arg: trained compressor + explicit level (1-9). '' or NULL for the
+-- trained-compressor argument falls back to the generic graph.
 SELECT openzl_compress('staging.parquet', 'data.zl', 'nbbo.compressor', 9);
+-- BLOB overload: trained compressor as in-memory bytes instead of a path,
+-- e.g. read back from a table (NULL is an error here, not a fallback --
+-- there's no ambiguity to resolve the way there is with a possibly-empty path).
+SELECT openzl_compress('staging.parquet', 'data.zl',
+    (SELECT compressor_bytes FROM my_compressors WHERE name = 'nbbo'));
 
 COPY tbl TO 'data.zl' (FORMAT OPENZL, TRAINED_COMPRESSOR 'nbbo.compressor', COMPRESSION_LEVEL 9);
 ```
+
+(`COPY`'s `TRAINED_COMPRESSOR` option is file-path-only: `COPY` options must
+be literal/constant at bind time, so there's no clean way to reference a
+per-query BLOB value there the way a scalar function argument can.)
 
 ## Training
 
@@ -131,11 +142,11 @@ SELECT * FROM openzl_train(
     clustering_trainer := 'bottom_up',
     dict_training := true
 );
--- ┌─────────────────┬──────────────────┐
--- │ candidate_index │   output_path    │
--- ├─────────────────┼──────────────────┤
--- │               0 │ nbbo.compressor  │
--- └─────────────────┴──────────────────┘
+-- ┌─────────────────┬─────────────────┬──────────────────┐
+-- │ candidate_index │   output_path   │ compressor_bytes │
+-- ├─────────────────┼─────────────────┼──────────────────┤
+-- │               0 │ nbbo.compressor │ <binary data>    │
+-- └─────────────────┴─────────────────┴──────────────────┘
 
 -- Then compress with it, same as any other file:
 COPY tbl TO 'data.zl' (FORMAT OPENZL, TRAINED_COMPRESSOR 'nbbo.compressor');
@@ -167,6 +178,36 @@ same types) -- compressing differently-shaped data with it throws an OpenZL
 error, not silent misbehavior. Decompression needs no awareness of training
 at all: `openzl_decompress`/`read_openzl` work identically either way, since
 OpenZL archives are self-describing.
+
+### Where trained compressors live: outside the database, or inside it
+
+Trained compressors are tiny (a serialized graph description, typically a
+few KB -- not a copy of any data), so storing one per recurring table shape
+costs essentially nothing. `openzl_train`'s `output_path` argument controls
+whether one is written to disk at all:
+
+```sql
+-- "Outside": write a file (as shown above). output_path is required and
+-- non-NULL; this is what every example above does.
+
+-- "Inside": pass NULL for output_path -- no file is written, but every
+-- result row still carries the trained compressor's raw bytes in the
+-- compressor_bytes column, for storing however you like via ordinary SQL:
+CREATE TABLE openzl_compressors AS
+SELECT candidate_index, compressor_bytes
+FROM openzl_train(['sample1.parquet', 'sample2.parquet'], NULL);
+
+-- Later, compress with it via the BLOB overload of openzl_compress:
+SELECT openzl_compress('staging.parquet', 'data.zl',
+    (SELECT compressor_bytes FROM openzl_compressors WHERE candidate_index = 0));
+```
+
+Nothing stops using both at once (a real output_path *and* reading
+compressor_bytes back to also insert into a table) -- `output_path` only
+controls on-disk file persistence; the `compressor_bytes` column is always
+populated either way. There's no built-in "inside the database" mechanism
+beyond that: it's just an ordinary table with a `BLOB` column, so it gets
+whatever indexing, backup, and querying behavior any other table would.
 
 ## How native linking works
 

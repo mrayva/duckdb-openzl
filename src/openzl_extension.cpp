@@ -92,6 +92,43 @@ inline void OpenzlCompressWithOptionsFun(DataChunk &args, ExpressionState &state
 	}
 }
 
+// openzl_compress(input_parquet, output_zl, trained_compressor_bytes[, compression_level]) -> output_zl
+//
+// Same as the VARCHAR trained_compressor overload above, except the trained
+// compressor is passed as already-in-memory bytes -- e.g. a BLOB column read
+// back from a table, for callers who keep trained compressors "inside the
+// database" instead of as standalone files (see openzl_train's
+// compressor_bytes output column). Unlike the path-based overload, an empty/
+// NULL blob is an error, not a generic-graph fallback: use the VARCHAR
+// overload with '' for that.
+inline void OpenzlCompressWithBlobOptionsFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto count = args.size();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t i = 0; i < count; i++) {
+		auto input_path = args.data[0].GetValue(i).ToString();
+		auto output_path = args.data[1].GetValue(i).ToString();
+		auto trained_value = args.data[2].GetValue(i);
+		if (trained_value.IsNull()) {
+			throw IOException("openzl_compress: trained_compressor_bytes must not be NULL");
+		}
+		string compressor_bytes = StringValue::Get(trained_value);
+		int compression_level = 9;
+		if (args.ColumnCount() > 3) {
+			auto level_value = args.data[3].GetValue(i);
+			if (!level_value.IsNull()) {
+				compression_level = level_value.GetValue<int32_t>();
+			}
+		}
+		try {
+			openzl_bridge::CompressParquetWithCompressorBytes(input_path, output_path, compressor_bytes,
+			                                                   compression_level);
+		} catch (const openzl_bridge::Error &e) {
+			throw IOException(e.what());
+		}
+		result.SetValue(i, Value(output_path));
+	}
+}
+
 // read_openzl(path) -> table
 //
 // Single-call replacement for read_parquet(openzl_decompress(...)): decompresses
@@ -120,14 +157,22 @@ static const DefaultTableMacro OpenzlReadMacro = {
 //     ['sample1.parquet', 'sample2.parquet'], 'nbbo.compressor',
 //     clustering_trainer := 'bottom_up', dict_training := true);
 //
-// Returns one row per output file: (candidate_index, output_path). Normally
-// that's a single row -- pareto_frontier := true instead returns one row per
-// point on the ratio/speed trade-off curve, letting the caller pick one.
+// output_path may be NULL to skip writing a file entirely: every result row
+// still carries the trained compressor's raw bytes in compressor_bytes, for
+// the caller to persist "inside the database" instead -- e.g.
+// CREATE TABLE compressors AS SELECT * FROM openzl_train([...], NULL);
+// stores it in an ordinary table (a BLOB column), rather than as a
+// standalone file. Both may be used together (write a file AND get the
+// bytes back) -- output_path only controls on-disk persistence.
+//
+// Returns one row per candidate. Normally that's a single row --
+// pareto_frontier := true instead returns one row per point on the
+// ratio/speed trade-off curve, letting the caller pick one.
 //
 // All options below are optional; see openzl_train_bridge.hpp for what each
 // one does to OpenZL's training search.
 struct OpenzlTrainBindData : public TableFunctionData {
-	vector<string> output_paths;
+	vector<openzl_bridge::TrainedOutput> outputs;
 };
 
 static Value GetNamedParameter(TableFunctionBindInput &input, const string &name) {
@@ -177,7 +222,9 @@ static unique_ptr<FunctionData> OpenzlTrainBind(ClientContext &context, TableFun
 	for (auto &child : ListValue::GetChildren(input.inputs[0])) {
 		sample_paths.push_back(StringValue::Get(child));
 	}
-	string output_path = StringValue::Get(input.inputs[1]);
+	// NULL means "don't write a file, just return the bytes" -- see the
+	// comment on OpenzlTrainBindData above.
+	string output_path = input.inputs[1].IsNull() ? string() : StringValue::Get(input.inputs[1]);
 
 	openzl_bridge::TrainOptions opts;
 	opts.threads = static_cast<unsigned int>(GetNamedBigint(input, "threads", 0));
@@ -196,7 +243,7 @@ static unique_ptr<FunctionData> OpenzlTrainBind(ClientContext &context, TableFun
 
 	auto result = make_uniq<OpenzlTrainBindData>();
 	try {
-		result->output_paths = openzl_bridge::Train(sample_paths, output_path, opts);
+		result->outputs = openzl_bridge::Train(sample_paths, output_path, opts);
 	} catch (const openzl_bridge::Error &e) {
 		throw IOException(e.what());
 	}
@@ -205,6 +252,8 @@ static unique_ptr<FunctionData> OpenzlTrainBind(ClientContext &context, TableFun
 	names.push_back("candidate_index");
 	return_types.push_back(LogicalType::VARCHAR);
 	names.push_back("output_path");
+	return_types.push_back(LogicalType::BLOB);
+	names.push_back("compressor_bytes");
 	return std::move(result);
 }
 
@@ -225,9 +274,11 @@ static void OpenzlTrainFunction(ClientContext &context, TableFunctionInput &data
 	auto &bind_data = data.bind_data->Cast<OpenzlTrainBindData>();
 	auto &gstate = data.global_state->Cast<OpenzlTrainGlobalState>();
 	idx_t count = 0;
-	while (gstate.offset < bind_data.output_paths.size() && count < STANDARD_VECTOR_SIZE) {
+	while (gstate.offset < bind_data.outputs.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &out = bind_data.outputs[gstate.offset];
 		output.SetValue(0, count, Value::BIGINT(static_cast<int64_t>(gstate.offset)));
-		output.SetValue(1, count, Value(bind_data.output_paths[gstate.offset]));
+		output.SetValue(1, count, out.path.empty() ? Value(LogicalType::VARCHAR) : Value(out.path));
+		output.SetValue(2, count, Value::BLOB_RAW(out.compressor_bytes));
 		gstate.offset++;
 		count++;
 	}
@@ -408,11 +459,36 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunctionSet openzl_compress_set("openzl_compress");
 	openzl_compress_set.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, OpenzlCompressFun));
-	openzl_compress_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                                LogicalType::VARCHAR, OpenzlCompressWithOptionsFun));
-	openzl_compress_set.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
-	                   LogicalType::VARCHAR, OpenzlCompressWithOptionsFun));
+
+	// The 3/4-arg overloads below all take SPECIAL_HANDLING: DuckDB's default
+	// null handling makes a scalar function itself a no-op returning NULL
+	// (never invoking our code at all) if ANY argument is NULL, which would
+	// silently skip compression entirely instead of falling back to the
+	// generic graph ('' or NULL, per the doc comments below) or erroring
+	// (a NULL trained_compressor_bytes blob) the way we actually want.
+	ScalarFunction compress_trained_path({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                      LogicalType::VARCHAR, OpenzlCompressWithOptionsFun);
+	compress_trained_path.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	openzl_compress_set.AddFunction(compress_trained_path);
+
+	ScalarFunction compress_trained_path_level(
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT}, LogicalType::VARCHAR,
+	    OpenzlCompressWithOptionsFun);
+	compress_trained_path_level.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	openzl_compress_set.AddFunction(compress_trained_path_level);
+
+	// BLOB overloads: trained compressor as in-memory bytes (e.g. from a
+	// table column) instead of a file path.
+	ScalarFunction compress_trained_blob({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BLOB},
+	                                      LogicalType::VARCHAR, OpenzlCompressWithBlobOptionsFun);
+	compress_trained_blob.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	openzl_compress_set.AddFunction(compress_trained_blob);
+
+	ScalarFunction compress_trained_blob_level(
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::BIGINT}, LogicalType::VARCHAR,
+	    OpenzlCompressWithBlobOptionsFun);
+	compress_trained_blob_level.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	openzl_compress_set.AddFunction(compress_trained_blob_level);
 	loader.RegisterFunction(openzl_compress_set);
 
 	auto read_openzl_info = DefaultTableFunctionGenerator::CreateTableMacroInfo(OpenzlReadMacro);

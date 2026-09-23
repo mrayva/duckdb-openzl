@@ -57,4 +57,13 @@ void Decompress(const std::string &input_path, const std::string &output_path);
 void CompressParquet(const std::string &input_parquet_path, const std::string &output_zl_path,
                       const std::string &trained_compressor_path = std::string(), int compression_level = 9);
 
+// Same as CompressParquet(), except the trained compressor is passed as
+// already-in-memory bytes (e.g. read from a BLOB column in a DuckDB table)
+// rather than a file path -- for callers who keep trained compressors
+// "inside the database" instead of as standalone files. `compressor_bytes`
+// must be non-empty (there's no generic-graph fallback here; call
+// CompressParquet() directly for that).
+void CompressParquetWithCompressorBytes(const std::string &input_parquet_path, const std::string &output_zl_path,
+                                         const std::string &compressor_bytes, int compression_level = 9);
+
 } // namespace openzl_bridge
