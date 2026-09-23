@@ -1,7 +1,6 @@
 #include "openzl_bridge.hpp"
 
-#include <fstream>
-#include <sstream>
+#include <memory>
 
 #include "openzl/cpp/CCtx.hpp"
 #include "openzl/cpp/CParam.hpp"
@@ -10,62 +9,17 @@
 #include "openzl/cpp/Exception.hpp"
 #include "openzl/zl_version.h"
 
-#include "custom_parsers/parquet/parquet_graph.h"
-#include "custom_parsers/shared_components/clustering.h"
+#include "custom_parsers/dependency_registration.h"
+
+#include "openzl_internal_io.hpp"
 
 namespace openzl_bridge {
 
-namespace {
-
-bool FileExists(const std::string &path) {
-	std::ifstream f(path, std::ios::binary);
-	return f.good();
-}
-
-size_t FileSize(const std::string &path) {
-	std::ifstream f(path, std::ios::binary | std::ios::ate);
-	return static_cast<size_t>(f.tellg());
-}
-
-std::string ReadFile(const std::string &path) {
-	std::ifstream f(path, std::ios::binary);
-	if (!f) {
-		throw Error("openzl_bridge: could not open file for reading: " + path);
-	}
-	std::ostringstream ss;
-	ss << f.rdbuf();
-	if (f.bad()) {
-		throw Error("openzl_bridge: error reading file: " + path);
-	}
-	return ss.str();
-}
-
-void WriteFile(const std::string &path, const std::string &contents) {
-	std::ofstream f(path, std::ios::binary | std::ios::trunc);
-	if (!f) {
-		throw Error("openzl_bridge: could not open file for writing: " + path);
-	}
-	f.write(contents.data(), static_cast<std::streamsize>(contents.size()));
-	if (!f) {
-		throw Error("openzl_bridge: error writing file: " + path);
-	}
-}
-
-// Builds the "parquet" compression graph (canonical parquet bytes in,
-// OpenZL-compressed bytes out): a generic clustering successor feeding the
-// parquet-aware graph, matching what `zli --profile parquet` builds
-// internally (see facebook/openzl cli/utils/compress_profiles.cpp). No
-// chunking -- our files are already modestly sized per-table Parquet exports.
-openzl::Compressor BuildParquetCompressor() {
-	openzl::Compressor compressor;
-	ZL_Compressor *comp = compressor.get();
-	ZL_GraphID clustering = ZS2_createGraph_genericClustering(comp);
-	ZL_GraphID parquet_graph = ZL_Parquet_registerGraph(comp, clustering);
-	compressor.selectStartingGraph(parquet_graph);
-	return compressor;
-}
-
-} // namespace
+using internal::FileExists;
+using internal::FileSize;
+using internal::ReadFile;
+using internal::WriteFile;
+using internal::BuildParquetCompressor;
 
 void Decompress(const std::string &input_path, const std::string &output_path) {
 	if (!FileExists(input_path)) {
@@ -92,9 +46,13 @@ void Decompress(const std::string &input_path, const std::string &output_path) {
 // around it: split the source table into chunks below this size).
 constexpr size_t kMaxCanonicalParquetBytes = 2'000'000'000;
 
-void CompressParquet(const std::string &input_parquet_path, const std::string &output_zl_path) {
+void CompressParquet(const std::string &input_parquet_path, const std::string &output_zl_path,
+                      const std::string &trained_compressor_path, int compression_level) {
 	if (!FileExists(input_parquet_path)) {
 		throw Error("openzl_bridge: input parquet file not found: " + input_parquet_path);
+	}
+	if (!trained_compressor_path.empty() && !FileExists(trained_compressor_path)) {
+		throw Error("openzl_bridge: trained compressor file not found: " + trained_compressor_path);
 	}
 	try {
 		size_t input_size = FileSize(input_parquet_path);
@@ -107,19 +65,32 @@ void CompressParquet(const std::string &input_parquet_path, const std::string &o
 			            "compress each chunk separately.");
 		}
 		std::string input = ReadFile(input_parquet_path);
-		openzl::Compressor compressor = BuildParquetCompressor();
+
+		// A trained compressor's serialized graph already encodes its own
+		// column layout/clustering decisions; createCompressorFromSerialized
+		// re-registers whatever custom dependencies it references (e.g. the
+		// "Parquet Parser" graph) automatically, the same way it's built fresh
+		// for the generic path below.
+		std::unique_ptr<openzl::Compressor> trained_compressor;
+		openzl::Compressor generic_compressor;
+		openzl::Compressor *compressor;
+		if (!trained_compressor_path.empty()) {
+			std::string serialized = ReadFile(trained_compressor_path);
+			trained_compressor = openzl::custom_parsers::createCompressorFromSerialized(serialized, "");
+			compressor = trained_compressor.get();
+		} else {
+			generic_compressor = BuildParquetCompressor();
+			compressor = &generic_compressor;
+		}
+
 		openzl::CCtx cctx;
 		// zli's CLI sets this implicitly to the newest format the linked
 		// OpenZL build supports; we must set it explicitly when driving the
 		// C++ API directly, or compression fails with "Format version is not
 		// set" (ZL_CParam_formatVersion, gcparams.c).
 		cctx.setParameter(openzl::CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
-		// Max level (default is 6, range 1-9): benchmarked against real mirror
-		// tables, this is consistently smaller than the default for a modest,
-		// well-worth-it CPU cost -- this is a compress-once/read-many archival
-		// workload, so we bias fully toward ratio over compression speed.
-		cctx.setParameter(openzl::CParam::CompressionLevel, 9);
-		cctx.refCompressor(compressor);
+		cctx.setParameter(openzl::CParam::CompressionLevel, compression_level);
+		cctx.refCompressor(*compressor);
 		std::string output = cctx.compressSerial(input);
 		WriteFile(output_zl_path, output);
 	} catch (const Error &) {

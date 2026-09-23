@@ -2,6 +2,7 @@
 
 #include "openzl_extension.hpp"
 #include "openzl_bridge.hpp"
+#include "openzl_train_bridge.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
@@ -9,6 +10,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 
 #include <cstdio>
@@ -55,6 +57,41 @@ inline void OpenzlCompressFun(DataChunk &args, ExpressionState &state, Vector &r
 	    });
 }
 
+// openzl_compress(input_parquet, output_zl, trained_compressor[, compression_level]) -> output_zl
+//
+// Same as openzl_compress/2, but compresses with a compressor previously
+// produced by openzl_train() instead of the generic "parquet" graph.
+// `trained_compressor` may be '' or NULL to fall back to the generic graph
+// (useful when a caller wants a single code path that conditionally trains).
+// `compression_level` (1-9, default 9) applies either way.
+//
+// Implemented with plain per-row Value access rather than a vectorized
+// executor: this function does real file I/O and OpenZL compression work per
+// call, so the row-boxing overhead here is immaterial.
+inline void OpenzlCompressWithOptionsFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto count = args.size();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t i = 0; i < count; i++) {
+		auto input_path = args.data[0].GetValue(i).ToString();
+		auto output_path = args.data[1].GetValue(i).ToString();
+		auto trained_value = args.data[2].GetValue(i);
+		string trained_path = trained_value.IsNull() ? string() : trained_value.ToString();
+		int compression_level = 9;
+		if (args.ColumnCount() > 3) {
+			auto level_value = args.data[3].GetValue(i);
+			if (!level_value.IsNull()) {
+				compression_level = level_value.GetValue<int32_t>();
+			}
+		}
+		try {
+			openzl_bridge::CompressParquet(input_path, output_path, trained_path, compression_level);
+		} catch (const openzl_bridge::Error &e) {
+			throw IOException(e.what());
+		}
+		result.SetValue(i, Value(output_path));
+	}
+}
+
 // read_openzl(path) -> table
 //
 // Single-call replacement for read_parquet(openzl_decompress(...)): decompresses
@@ -73,6 +110,149 @@ static const DefaultTableMacro OpenzlReadMacro = {
     DEFAULT_SCHEMA, "read_openzl", {"path", nullptr}, {{nullptr, nullptr}},
     R"(SELECT * FROM read_parquet(openzl_decompress(path, regexp_replace(path, '\.zl$', '') || '.parquet')))"};
 
+// openzl_train(sample_paths, output_path[, named options...]) -> table
+//
+// Trains a compressor against a batch of representative canonical-parquet
+// sample files (same schema as the table(s) it'll later compress) and writes
+// the result to output_path, for reuse via openzl_compress's or
+// COPY ... FORMAT OPENZL's trained-compressor argument. Typical usage:
+//   SELECT * FROM openzl_train(
+//     ['sample1.parquet', 'sample2.parquet'], 'nbbo.compressor',
+//     clustering_trainer := 'bottom_up', dict_training := true);
+//
+// Returns one row per output file: (candidate_index, output_path). Normally
+// that's a single row -- pareto_frontier := true instead returns one row per
+// point on the ratio/speed trade-off curve, letting the caller pick one.
+//
+// All options below are optional; see openzl_train_bridge.hpp for what each
+// one does to OpenZL's training search.
+struct OpenzlTrainBindData : public TableFunctionData {
+	vector<string> output_paths;
+};
+
+static Value GetNamedParameter(TableFunctionBindInput &input, const string &name) {
+	auto it = input.named_parameters.find(name);
+	if (it == input.named_parameters.end()) {
+		return Value();
+	}
+	return it->second;
+}
+
+static string GetNamedString(TableFunctionBindInput &input, const string &name, const string &default_value) {
+	auto value = GetNamedParameter(input, name);
+	return value.IsNull() ? default_value : value.ToString();
+}
+
+static int64_t GetNamedBigint(TableFunctionBindInput &input, const string &name, int64_t default_value) {
+	auto value = GetNamedParameter(input, name);
+	return value.IsNull() ? default_value : value.GetValue<int64_t>();
+}
+
+static bool GetNamedBool(TableFunctionBindInput &input, const string &name, bool default_value) {
+	auto value = GetNamedParameter(input, name);
+	return value.IsNull() ? default_value : value.GetValue<bool>();
+}
+
+static openzl_bridge::ClusteringTrainer ParseClusteringTrainer(const string &value) {
+	if (value == "greedy") {
+		return openzl_bridge::ClusteringTrainer::Greedy;
+	}
+	if (value == "bottom_up") {
+		return openzl_bridge::ClusteringTrainer::BottomUp;
+	}
+	if (value == "full_split") {
+		return openzl_bridge::ClusteringTrainer::FullSplit;
+	}
+	throw BinderException(
+	    "openzl_train: clustering_trainer must be 'greedy', 'bottom_up', or 'full_split', got '" + value + "'");
+}
+
+static unique_ptr<FunctionData> OpenzlTrainBind(ClientContext &context, TableFunctionBindInput &input,
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
+	if (input.inputs[0].IsNull() || input.inputs[0].type().id() != LogicalTypeId::LIST) {
+		throw BinderException(
+		    "openzl_train: first argument must be a list of sample file paths, e.g. ['a.parquet', 'b.parquet']");
+	}
+	vector<string> sample_paths;
+	for (auto &child : ListValue::GetChildren(input.inputs[0])) {
+		sample_paths.push_back(StringValue::Get(child));
+	}
+	string output_path = StringValue::Get(input.inputs[1]);
+
+	openzl_bridge::TrainOptions opts;
+	opts.threads = static_cast<unsigned int>(GetNamedBigint(input, "threads", 0));
+	opts.clustering_trainer = ParseClusteringTrainer(GetNamedString(input, "clustering_trainer", "greedy"));
+	opts.num_samples = static_cast<size_t>(GetNamedBigint(input, "num_samples", 0));
+	opts.no_ace_successors = GetNamedBool(input, "no_ace_successors", false);
+	opts.no_clustering = GetNamedBool(input, "no_clustering", false);
+	opts.dict_training = GetNamedBool(input, "dict_training", false);
+	opts.max_time_secs = static_cast<size_t>(GetNamedBigint(input, "max_time_secs", 0));
+	opts.max_file_size_mb = static_cast<size_t>(GetNamedBigint(input, "max_file_size_mb", 0));
+	opts.max_total_size_mb = static_cast<size_t>(GetNamedBigint(input, "max_total_size_mb", 0));
+	opts.pareto_frontier = GetNamedBool(input, "pareto_frontier", false);
+	opts.max_num_candidates = static_cast<size_t>(GetNamedBigint(input, "max_num_candidates", 0));
+	opts.compression_level = static_cast<int>(GetNamedBigint(input, "compression_level", 9));
+	opts.verbose = GetNamedBool(input, "verbose", false);
+
+	auto result = make_uniq<OpenzlTrainBindData>();
+	try {
+		result->output_paths = openzl_bridge::Train(sample_paths, output_path, opts);
+	} catch (const openzl_bridge::Error &e) {
+		throw IOException(e.what());
+	}
+
+	return_types.push_back(LogicalType::BIGINT);
+	names.push_back("candidate_index");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("output_path");
+	return std::move(result);
+}
+
+struct OpenzlTrainGlobalState : public GlobalTableFunctionState {
+	idx_t offset = 0;
+};
+
+static unique_ptr<GlobalTableFunctionState> OpenzlTrainInitGlobal(ClientContext &context,
+                                                                   TableFunctionInitInput &input) {
+	return make_uniq<OpenzlTrainGlobalState>();
+}
+
+// The actual training work already happened in Bind (it's a one-shot,
+// non-streaming search over a fixed, already-in-hand sample set, not
+// something that benefits from the scan-style init/execute split) -- this
+// just emits the small number of already-computed result rows.
+static void OpenzlTrainFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<OpenzlTrainBindData>();
+	auto &gstate = data.global_state->Cast<OpenzlTrainGlobalState>();
+	idx_t count = 0;
+	while (gstate.offset < bind_data.output_paths.size() && count < STANDARD_VECTOR_SIZE) {
+		output.SetValue(0, count, Value::BIGINT(static_cast<int64_t>(gstate.offset)));
+		output.SetValue(1, count, Value(bind_data.output_paths[gstate.offset]));
+		gstate.offset++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+static TableFunction GetOpenzlTrainFunction() {
+	TableFunction function("openzl_train", {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
+	                        OpenzlTrainFunction, OpenzlTrainBind, OpenzlTrainInitGlobal);
+	function.named_parameters["threads"] = LogicalType::BIGINT;
+	function.named_parameters["clustering_trainer"] = LogicalType::VARCHAR;
+	function.named_parameters["num_samples"] = LogicalType::BIGINT;
+	function.named_parameters["no_ace_successors"] = LogicalType::BOOLEAN;
+	function.named_parameters["no_clustering"] = LogicalType::BOOLEAN;
+	function.named_parameters["dict_training"] = LogicalType::BOOLEAN;
+	function.named_parameters["max_time_secs"] = LogicalType::BIGINT;
+	function.named_parameters["max_file_size_mb"] = LogicalType::BIGINT;
+	function.named_parameters["max_total_size_mb"] = LogicalType::BIGINT;
+	function.named_parameters["pareto_frontier"] = LogicalType::BOOLEAN;
+	function.named_parameters["max_num_candidates"] = LogicalType::BIGINT;
+	function.named_parameters["compression_level"] = LogicalType::BIGINT;
+	function.named_parameters["verbose"] = LogicalType::BOOLEAN;
+	return function;
+}
+
 // COPY tbl TO 'data.zl' (FORMAT OPENZL)
 //
 // Delegates entirely to the catalog's registered "parquet" CopyFunction to do
@@ -88,16 +268,23 @@ struct OpenzlCopyBindData : public FunctionData {
 
 	CopyFunction parquet_copy_function;
 	unique_ptr<FunctionData> parquet_bind_data;
+	// '' = use the generic "parquet" graph (default).
+	string trained_compressor_path;
+	int compression_level = 9;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<OpenzlCopyBindData>();
 		result->parquet_copy_function = parquet_copy_function;
 		result->parquet_bind_data = parquet_bind_data->Copy();
+		result->trained_compressor_path = trained_compressor_path;
+		result->compression_level = compression_level;
 		return std::move(result);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<OpenzlCopyBindData>();
-		return parquet_bind_data->Equals(*other.parquet_bind_data);
+		return parquet_bind_data->Equals(*other.parquet_bind_data) &&
+		       trained_compressor_path == other.trained_compressor_path &&
+		       compression_level == other.compression_level;
 	}
 };
 
@@ -131,6 +318,15 @@ static unique_ptr<FunctionData> OpenzlCopyBind(ClientContext &context, CopyFunct
 	CopyFunctionBindInput parquet_bind_input(parquet_info);
 	result->parquet_bind_data =
 	    result->parquet_copy_function.copy_to_bind(context, parquet_bind_input, names, sql_types);
+
+	auto trained_it = input.info.options.find("trained_compressor");
+	if (trained_it != input.info.options.end() && !trained_it->second.empty()) {
+		result->trained_compressor_path = trained_it->second[0].ToString();
+	}
+	auto level_it = input.info.options.find("compression_level");
+	if (level_it != input.info.options.end() && !level_it->second.empty()) {
+		result->compression_level = level_it->second[0].GetValue<int32_t>();
+	}
 	return std::move(result);
 }
 
@@ -184,7 +380,8 @@ static void OpenzlCopyFinalize(ClientContext &context, FunctionData &bind_data_p
 	bind_data.parquet_copy_function.copy_to_finalize(context, *bind_data.parquet_bind_data,
 	                                                  *gstate.parquet_global_state);
 	try {
-		openzl_bridge::CompressParquet(gstate.tmp_parquet_path, gstate.final_zl_path);
+		openzl_bridge::CompressParquet(gstate.tmp_parquet_path, gstate.final_zl_path, bind_data.trained_compressor_path,
+		                                bind_data.compression_level);
 	} catch (const openzl_bridge::Error &e) {
 		std::remove(gstate.tmp_parquet_path.c_str());
 		throw IOException(e.what());
@@ -208,13 +405,21 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ScalarFunction("openzl_decompress", {LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                                        LogicalType::VARCHAR, OpenzlDecompressFun));
 
-	loader.RegisterFunction(ScalarFunction("openzl_compress", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                        LogicalType::VARCHAR, OpenzlCompressFun));
+	ScalarFunctionSet openzl_compress_set("openzl_compress");
+	openzl_compress_set.AddFunction(
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, OpenzlCompressFun));
+	openzl_compress_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                                LogicalType::VARCHAR, OpenzlCompressWithOptionsFun));
+	openzl_compress_set.AddFunction(
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+	                   LogicalType::VARCHAR, OpenzlCompressWithOptionsFun));
+	loader.RegisterFunction(openzl_compress_set);
 
 	auto read_openzl_info = DefaultTableFunctionGenerator::CreateTableMacroInfo(OpenzlReadMacro);
 	loader.RegisterFunction(*read_openzl_info);
 
 	loader.RegisterFunction(GetOpenzlCopyFunction());
+	loader.RegisterFunction(GetOpenzlTrainFunction());
 }
 
 void OpenzlExtension::Load(ExtensionLoader &loader) {

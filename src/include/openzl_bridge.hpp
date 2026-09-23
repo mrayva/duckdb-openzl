@@ -42,6 +42,19 @@ void Decompress(const std::string &input_path, const std::string &output_path);
 //     (FORMAT PARQUET, COMPRESSION 'uncompressed', DICTIONARY_SIZE_LIMIT 0);
 // Throws openzl_bridge::Error on failure, including if the input isn't
 // already canonical (the OpenZL parquet graph will reject it).
-void CompressParquet(const std::string &input_parquet_path, const std::string &output_zl_path);
+//
+// `trained_compressor_path`, if non-empty, points to a serialized compressor
+// produced by Train() (see openzl_train_bridge.hpp): the input is compressed
+// with that trained graph instead of the generic one. The trained compressor
+// must have been trained against data shaped like `input_parquet_path` (same
+// columns/types) -- OpenZL will throw if the graph doesn't apply.
+//
+// `compression_level` (1-9, default 9) is OpenZL's own generic-backend
+// compression level; it applies whether or not a trained compressor is used.
+//
+// Throws openzl_bridge::Error if the input exceeds a safe size (see
+// CompressParquet's .cpp for why) -- split the source into smaller chunks.
+void CompressParquet(const std::string &input_parquet_path, const std::string &output_zl_path,
+                      const std::string &trained_compressor_path = std::string(), int compression_level = 9);
 
 } // namespace openzl_bridge

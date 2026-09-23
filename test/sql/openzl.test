@@ -90,3 +90,101 @@ query I
 SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_copyfmt.zl');
 ----
 5
+
+# ---- openzl_train() ----
+
+statement error
+SELECT * FROM openzl_train('not_a_list.parquet', '__TEST_DIR__/x.compressor');
+----
+No function matches
+
+statement error
+SELECT * FROM openzl_train(NULL::VARCHAR[], '__TEST_DIR__/x.compressor');
+----
+must be a list of sample file paths
+
+statement error
+SELECT * FROM openzl_train([]::VARCHAR[], '__TEST_DIR__/x.compressor');
+----
+requires at least one sample file
+
+statement error
+SELECT * FROM openzl_train(['/nonexistent/sample.parquet'], '__TEST_DIR__/x.compressor');
+----
+sample file not found
+
+statement error
+SELECT * FROM openzl_train(['__TEST_DIR__/openzl_roundtrip.parquet'], '__TEST_DIR__/x.compressor', clustering_trainer := 'bogus');
+----
+clustering_trainer must be
+
+# Three same-shaped sample files (different data, same schema) to train
+# against; no_ace_successors keeps this fast enough for a test suite (the
+# full ACE search is real optimization work, exercised manually/in
+# benchmarks, not needed to prove the plumbing is correct here).
+statement ok
+COPY (SELECT range AS a, 'row_' || range AS b FROM range(200)) TO '__TEST_DIR__/openzl_train_1.parquet' (FORMAT PARQUET, COMPRESSION 'uncompressed', DICTIONARY_SIZE_LIMIT 0);
+
+statement ok
+COPY (SELECT range + 1000 AS a, 'row_' || (range + 1000) AS b FROM range(200)) TO '__TEST_DIR__/openzl_train_2.parquet' (FORMAT PARQUET, COMPRESSION 'uncompressed', DICTIONARY_SIZE_LIMIT 0);
+
+statement ok
+COPY (SELECT range + 2000 AS a, 'row_' || (range + 2000) AS b FROM range(200)) TO '__TEST_DIR__/openzl_train_3.parquet' (FORMAT PARQUET, COMPRESSION 'uncompressed', DICTIONARY_SIZE_LIMIT 0);
+
+query II
+SELECT candidate_index, output_path FROM openzl_train(
+    ['__TEST_DIR__/openzl_train_1.parquet', '__TEST_DIR__/openzl_train_2.parquet', '__TEST_DIR__/openzl_train_3.parquet'],
+    '__TEST_DIR__/openzl_trained.compressor',
+    no_ace_successors := true,
+    clustering_trainer := 'greedy'
+);
+----
+0	__TEST_DIR__/openzl_trained.compressor
+
+# pareto_frontier writes one numbered file per candidate and returns one row
+# each.
+query I
+SELECT count(*) > 0 FROM openzl_train(
+    ['__TEST_DIR__/openzl_train_1.parquet', '__TEST_DIR__/openzl_train_2.parquet', '__TEST_DIR__/openzl_train_3.parquet'],
+    '__TEST_DIR__/openzl_pareto.compressor',
+    no_ace_successors := true,
+    pareto_frontier := true
+);
+----
+1
+
+# Compressing with the trained compressor round-trips correctly against
+# held-out data (openzl_train_1, not one of the training samples used above
+# -- well, it was, but the point here is plumbing correctness, not held-out
+# generalization, which is exercised manually/in benchmarks instead).
+statement ok
+SELECT openzl_compress('__TEST_DIR__/openzl_train_1.parquet', '__TEST_DIR__/openzl_trained_output.zl', '__TEST_DIR__/openzl_trained.compressor');
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_trained_output.zl');
+----
+200
+
+# Empty trained_compressor path falls back to the generic graph rather than
+# erroring.
+statement ok
+SELECT openzl_compress('__TEST_DIR__/openzl_train_1.parquet', '__TEST_DIR__/openzl_fallback.zl', '');
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_fallback.zl');
+----
+200
+
+statement error
+SELECT openzl_compress('__TEST_DIR__/openzl_train_1.parquet', '__TEST_DIR__/x.zl', '/nonexistent/compressor');
+----
+trained compressor file not found
+
+# COPY ... FORMAT OPENZL with TRAINED_COMPRESSOR and COMPRESSION_LEVEL options.
+statement ok
+COPY t TO '__TEST_DIR__/openzl_copy_trained.zl' (FORMAT OPENZL, TRAINED_COMPRESSOR '__TEST_DIR__/openzl_trained.compressor', COMPRESSION_LEVEL 9);
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_copy_trained.zl');
+----
+1000

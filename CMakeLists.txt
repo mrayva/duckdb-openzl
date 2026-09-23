@@ -40,7 +40,42 @@ set(OPENZL_INSTALL OFF CACHE BOOL "" FORCE)
 include_directories(BEFORE third_party/openzl/deps/zstd/lib)
 add_subdirectory(third_party/openzl EXCLUDE_FROM_ALL)
 
-set(EXTENSION_SOURCES src/openzl_extension.cpp src/openzl_bridge.cpp)
+# ---- Training support (openzl::training::train()) ----
+# OpenZL's own tools/training/ subsystem (clustering/ACE/dict trainers) is
+# only built when OPENZL_BUILD_TOOLS or OPENZL_BUILD_CLI is ON -- both
+# deliberately OFF above, since either would also drag in argument-parsing
+# tools, SDDL tools, and (worse) the ml_selector's xgboost dependency, none
+# of which the actual training entry point needs. Those flags are plain
+# `set()` calls inside OpenZL's tools/CMakeLists.txt (not CACHE variables),
+# so they can't be overridden from our scope once that file runs -- instead
+# of fighting that, compile the handful of source directories training
+# actually needs (training/, plus its small io/logger deps) ourselves,
+# bypassing OpenZL's own tools/ subdirectory gating entirely.
+file(GLOB_RECURSE OPENZL_TRAINING_SOURCES CONFIGURE_DEPENDS
+  "third_party/openzl/tools/training/*.cpp")
+list(FILTER OPENZL_TRAINING_SOURCES EXCLUDE REGEX "/tests/")
+file(GLOB OPENZL_IO_SOURCES CONFIGURE_DEPENDS "third_party/openzl/tools/io/*.cpp")
+file(GLOB OPENZL_LOGGER_SOURCES CONFIGURE_DEPENDS "third_party/openzl/tools/logger/*.cpp")
+
+add_library(openzl_training STATIC
+  ${OPENZL_TRAINING_SOURCES}
+  ${OPENZL_IO_SOURCES}
+  ${OPENZL_LOGGER_SOURCES})
+target_include_directories(openzl_training PRIVATE
+  third_party/openzl
+  third_party/openzl/include
+  third_party/openzl/cpp/include)
+# zstd's advanced dictionary-training API (ZDICT_*) used by the dict trainer
+# is only declared under this macro -- it's outside zstd's stable ABI.
+target_compile_definitions(openzl_training PUBLIC ZDICT_STATIC_LINKING_ONLY)
+set_target_properties(openzl_training PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_source_files_properties(
+  ${OPENZL_TRAINING_SOURCES} ${OPENZL_IO_SOURCES} ${OPENZL_LOGGER_SOURCES}
+  PROPERTIES COMPILE_OPTIONS "-std=c++17")
+target_link_libraries(openzl_training PUBLIC openzl openzl_cpp custom_parsers)
+add_dependencies(openzl_training openzl openzl_cpp custom_parsers)
+
+set(EXTENSION_SOURCES src/openzl_extension.cpp src/openzl_bridge.cpp src/openzl_train_bridge.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -58,14 +93,14 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # copy_function_catalog_entry.hpp disagrees on its linkage, causing a
 # "multiple definition" link error. Scoping the flag to the one file that
 # needs it avoids the whole class of mismatch.
-set_source_files_properties(src/openzl_bridge.cpp PROPERTIES COMPILE_OPTIONS "-std=c++17")
+set_source_files_properties(src/openzl_bridge.cpp src/openzl_train_bridge.cpp PROPERTIES COMPILE_OPTIONS "-std=c++17")
 
 foreach(TGT ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
   target_include_directories(${TGT} PRIVATE
     third_party/openzl/include
     third_party/openzl/cpp/include
     third_party/openzl)
-  target_link_libraries(${TGT} openzl openzl_cpp parquet_graph shared_components)
+  target_link_libraries(${TGT} openzl openzl_cpp parquet_graph shared_components openzl_training)
 endforeach()
 
 # No install(EXPORT ...) here: exporting the static extension target would

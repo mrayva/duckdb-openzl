@@ -93,6 +93,81 @@ extension targets, but worth knowing. `COPY ... (FORMAT OPENZL)` cleans up
 its own intermediate staging file (`<path>.openzl_staging.parquet`)
 unconditionally, including on error.
 
+`openzl_compress` and `COPY ... FORMAT OPENZL` both take an optional trained
+compressor (see [Training](#training) below) and an explicit compression
+level:
+
+```sql
+-- 2-arg: generic graph, compression level 9 (the default).
+SELECT openzl_compress('staging.parquet', 'data.zl');
+-- 3-arg: compress with a compressor produced by openzl_train().
+SELECT openzl_compress('staging.parquet', 'data.zl', 'nbbo.compressor');
+-- 4-arg: trained compressor + explicit level (1-9). '' for the trained-
+-- compressor argument falls back to the generic graph.
+SELECT openzl_compress('staging.parquet', 'data.zl', 'nbbo.compressor', 9);
+
+COPY tbl TO 'data.zl' (FORMAT OPENZL, TRAINED_COMPRESSOR 'nbbo.compressor', COMPRESSION_LEVEL 9);
+```
+
+## Training
+
+OpenZL's generic "parquet" graph (what every call above uses by default) is
+untuned -- the same graph regardless of what's actually in the data. OpenZL
+separately ships an offline **training** pipeline that searches for a better
+compressor given representative sample data: per-column clustering choices,
+optional codec exploration (ACE), and an optional shared dictionary. Since
+this project's mirror has a small number of recurring table *shapes* (NBBO,
+BBO, admin/CTS, ...) repeated across thousands of daily files, training once
+per shape and reusing the result is a real, bounded win -- benchmarked on a
+held-out day (not used in training) of one real table, a trained compressor
+came out **37% smaller than the generic graph and 30% smaller than zstd at
+its own maximum effort level (`COMPRESSION_LEVEL 19`)**.
+
+```sql
+-- Train against a batch of same-schema canonical parquet samples.
+SELECT * FROM openzl_train(
+    ['sample_2025-01.parquet', 'sample_2025-02.parquet', 'sample_2025-03.parquet'],
+    'nbbo.compressor',
+    clustering_trainer := 'bottom_up',
+    dict_training := true
+);
+-- ┌─────────────────┬──────────────────┐
+-- │ candidate_index │   output_path    │
+-- ├─────────────────┼──────────────────┤
+-- │               0 │ nbbo.compressor  │
+-- └─────────────────┴──────────────────┘
+
+-- Then compress with it, same as any other file:
+COPY tbl TO 'data.zl' (FORMAT OPENZL, TRAINED_COMPRESSOR 'nbbo.compressor');
+```
+
+`openzl_train`'s first two arguments are positional (sample file list, output
+path); everything else is an optional named parameter mirroring OpenZL's own
+`openzl::training::TrainParams` field-for-field (see
+`src/include/openzl_train_bridge.hpp` for the authoritative doc comments):
+
+| Parameter | Type | Default | What it does |
+|---|---|---|---|
+| `threads` | BIGINT | hardware concurrency | Parallelism for the training search itself (compress calls stay single-threaded). |
+| `clustering_trainer` | VARCHAR | `'greedy'` | Search strategy: `'greedy'` (fastest), `'bottom_up'`, or `'full_split'` (most thorough, slowest). |
+| `num_samples` | BIGINT | all | Caps how many of the sample files are actually used. |
+| `no_ace_successors` | BOOLEAN | `false` | Skips ACE (Automated Compressor Explorer) codec search -- faster, potentially worse. |
+| `no_clustering` | BOOLEAN | `false` | Skips per-column clustering search entirely. |
+| `dict_training` | BOOLEAN | `false` | Also trains a shared zstd dictionary -- helps when samples share repeated short strings (symbol codes, venue codes) beyond what clustering alone exploits. |
+| `max_time_secs` | BIGINT | no limit | Wall-clock budget for the search. |
+| `max_file_size_mb` | BIGINT | 150 | Skips individual sample files larger than this. |
+| `max_total_size_mb` | BIGINT | 300 | Stops accumulating samples once their total size crosses this. |
+| `pareto_frontier` | BOOLEAN | `false` | Returns a ratio/speed trade-off curve (one row + one output file per point) instead of a single best candidate. |
+| `max_num_candidates` | BIGINT | no cap | Caps candidates kept per trainer before combining results. |
+| `compression_level` | BIGINT | 9 | Applied to the base graph before training explores variations of it. |
+| `verbose` | BOOLEAN | `false` | OpenZL's training internals print CLI-style progress bars via a process-global logger; off by default since this runs from SQL, not a terminal. |
+
+A trained compressor is tied to the schema it was trained on (same columns,
+same types) -- compressing differently-shaped data with it throws an OpenZL
+error, not silent misbehavior. Decompression needs no awareness of training
+at all: `openzl_decompress`/`read_openzl` work identically either way, since
+OpenZL archives are self-describing.
+
 ## How native linking works
 
 - Building the "parquet" compression graph only needs
@@ -113,9 +188,21 @@ unconditionally, including on error.
 - CMakeLists.txt vendors OpenZL via `add_subdirectory(third_party/openzl)`
   with everything except `OPENZL_BUILD_CPP`/`OPENZL_BUILD_CUSTOM_PARSERS`
   turned off (no CLI, no generic tools, no tests, no parquet-tools/Arrow),
-  and links only `openzl` + `openzl_cpp` + `parquet_graph` +
-  `shared_components` -- all in-tree OpenZL static libs, no Arrow, no
-  `ExternalProject_Add`, no CLI arg-parser.
+  and links `openzl` + `openzl_cpp` + `parquet_graph` + `shared_components` +
+  `custom_parsers` (needed for `createCompressorFromSerialized`, used to load
+  a trained compressor -- see [Training](#training)) -- all in-tree OpenZL
+  static libs, no Arrow, no `ExternalProject_Add`, no CLI arg-parser.
+- Training (`src/openzl_train_bridge.cpp`) needs OpenZL's `tools/training/`
+  subsystem, which normally only builds when `OPENZL_BUILD_TOOLS` or
+  `OPENZL_BUILD_CLI` is on -- both plain (non-`CACHE`) `set()` calls inside
+  OpenZL's own `tools/CMakeLists.txt`, so they can't be overridden from
+  outside once that file runs, and turning either on would also pull in
+  arg-parsing tools, SDDL tools, and (worse) the ml_selector's xgboost
+  dependency. Instead of fighting that, our `CMakeLists.txt` compiles the
+  handful of source directories training actually needs
+  (`tools/training/**/*.cpp`, plus its small `tools/io`/`tools/logger` deps)
+  itself, as a separate `openzl_training` static library, bypassing OpenZL's
+  own `tools/` gating entirely.
 
 Two build gotchas worth knowing if you touch this again:
 - DuckDB's own top-level `CMakeLists.txt` pins `CMAKE_CXX_STANDARD` to `11`
@@ -124,16 +211,19 @@ Two build gotchas worth knowing if you touch this again:
   overwrites an existing entry, so ours was silently ignored. OpenZL's C++
   headers require C++17 (`poly::string_view`/`poly::optional` silently
   degrade to bogus fallback types under C++11 with no compile error until
-  you try to call something), but only `src/openzl_bridge.cpp` touches them.
-  Forcing C++17 on the *whole extension target* (via `CXX_STANDARD`) builds
-  fine but fails to **link**: `duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp`
+  you try to call something), but only `src/openzl_bridge.cpp` and
+  `src/openzl_train_bridge.cpp` (plus the `openzl_training` library's own
+  sources) touch them. Forcing C++17 on the *whole extension target* (via
+  `CXX_STANDARD`) builds fine but fails to **link**:
+  `duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp`
   declares `static constexpr const char *Name`, which is implicitly `inline`
   under C++17 but not C++11 -- compiling `openzl_extension.cpp` (which needs
   that header for the `COPY ... FORMAT OPENZL` support below) at a different
   standard than the rest of DuckDB disagrees on that symbol's linkage,
   producing a "multiple definition" error at final link time. Fixed by
-  scoping the flag to only the one file that needs it:
-  `set_source_files_properties(src/openzl_bridge.cpp PROPERTIES COMPILE_OPTIONS "-std=c++17")`.
+  scoping the flag to only the files that need it:
+  `set_source_files_properties(src/openzl_bridge.cpp src/openzl_train_bridge.cpp PROPERTIES COMPILE_OPTIONS "-std=c++17")`
+  (and equivalently for `openzl_training`'s own globbed sources).
 - DuckDB's build adds its own (older) vendored `zstd/include` to the
   directory-scoped include path, inherited by everything added via
   `add_subdirectory` afterward -- including OpenZL's. Left alone, OpenZL's C
@@ -173,9 +263,27 @@ Two build gotchas worth knowing if you touch this again:
   capturing the user's literal path at bind time makes overwriting an
   existing `.zl` archive behave correctly too.
 
+## Known limitations
+
+- **~2GiB input ceiling.** OpenZL's parquet compression graph crashes
+  (segfault, not a clean error) on large inputs -- empirically, compression
+  succeeded at 1.94GB and crashed at 2.42GB of canonical parquet, consistent
+  with an internal 32-bit (2^31-1 byte) size limit somewhere in the graph or
+  its dependencies that isn't checked before use. `CompressParquet()` checks
+  the input file's size upfront and throws a clear `IOException` instead of
+  crashing once it's over roughly 2,000,000,000 bytes -- but that means
+  tables whose canonical parquet exceeds this size **cannot currently be
+  OpenZL-compressed at all**. This isn't a rare edge case for wide/high-row
+  tables: split such a table into smaller chunks (e.g. by row range) and
+  compress each chunk as a separate `.zl` archive; there's no chunking
+  support built into this extension yet.
+
 ## Deliberately not yet implemented
 
 - **A Postgres extension** reusing `openzl_bridge.{hpp,cpp}` as-is.
+- **Chunking** for tables whose canonical parquet exceeds the ~2GiB limit
+  above -- would need COPY's sink/finalize logic to rotate through multiple
+  staging/output files, and `read_openzl` to transparently reassemble them.
 
 ## Building
 
