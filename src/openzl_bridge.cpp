@@ -91,6 +91,11 @@ void CompressParquet(const std::string &input_parquet_path, const std::string &o
 		// C++ API directly, or compression fails with "Format version is not
 		// set" (ZL_CParam_formatVersion, gcparams.c).
 		cctx.setParameter(openzl::CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+		// Max level (default is 6, range 1-9): benchmarked against real mirror
+		// tables, this is consistently smaller than the default for a modest,
+		// well-worth-it CPU cost -- this is a compress-once/read-many archival
+		// workload, so we bias fully toward ratio over compression speed.
+		cctx.setParameter(openzl::CParam::CompressionLevel, 9);
 		cctx.refCompressor(compressor);
 		std::string output = cctx.compressSerial(input);
 		WriteFile(output_zl_path, output);
