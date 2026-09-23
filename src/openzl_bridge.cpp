@@ -22,6 +22,11 @@ bool FileExists(const std::string &path) {
 	return f.good();
 }
 
+size_t FileSize(const std::string &path) {
+	std::ifstream f(path, std::ios::binary | std::ios::ate);
+	return static_cast<size_t>(f.tellg());
+}
+
 std::string ReadFile(const std::string &path) {
 	std::ifstream f(path, std::ios::binary);
 	if (!f) {
@@ -78,11 +83,29 @@ void Decompress(const std::string &input_path, const std::string &output_path) {
 	}
 }
 
+// Empirically determined: compression succeeded at 1.94GB and segfaulted at
+// 2.42GB of canonical parquet input on this OpenZL build, consistent with an
+// internal 32-bit (2^31-1 byte) size limit somewhere in the parquet graph or
+// its dependencies that isn't checked before use. This threshold is a
+// conservative cutoff below the observed crash point, not the exact boundary
+// (which wasn't worth pinning down further -- see README for how to work
+// around it: split the source table into chunks below this size).
+constexpr size_t kMaxCanonicalParquetBytes = 2'000'000'000;
+
 void CompressParquet(const std::string &input_parquet_path, const std::string &output_zl_path) {
 	if (!FileExists(input_parquet_path)) {
 		throw Error("openzl_bridge: input parquet file not found: " + input_parquet_path);
 	}
 	try {
+		size_t input_size = FileSize(input_parquet_path);
+		if (input_size > kMaxCanonicalParquetBytes) {
+			throw Error("openzl_bridge: input parquet file too large to compress safely (" +
+			            std::to_string(input_size) + " bytes, limit " +
+			            std::to_string(kMaxCanonicalParquetBytes) +
+			            "): OpenZL's parquet compression graph crashes above roughly this size. "
+			            "Split the source table into smaller chunks (e.g. by row count) and "
+			            "compress each chunk separately.");
+		}
 		std::string input = ReadFile(input_parquet_path);
 		openzl::Compressor compressor = BuildParquetCompressor();
 		openzl::CCtx cctx;
