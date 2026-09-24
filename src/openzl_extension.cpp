@@ -15,8 +15,31 @@
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 
 #include <cstdio>
+#include <fstream>
 
 namespace duckdb {
+
+// Runtime settings (registered in LoadInternal):
+//   openzl_max_compress_bytes -- refuse to compress one canonical-parquet
+//     input bigger than this in a single call (memory guard; compression peaks
+//     at ~4x input in RAM).
+//   openzl_chunk_size_bytes   -- COPY ... (FORMAT OPENZL) starts a new
+//     independent chunk once the staged parquet reaches this size; 0 disables.
+static size_t OpenzlSizeSetting(ClientContext &context, const char *name, size_t fallback) {
+	Value v;
+	if (context.TryGetCurrentSetting(name, v) && !v.IsNull()) {
+		return static_cast<size_t>(v.GetValue<uint64_t>());
+	}
+	return fallback;
+}
+
+static size_t OpenzlMaxCompressBytes(ClientContext &context) {
+	return OpenzlSizeSetting(context, "openzl_max_compress_bytes", openzl_bridge::kDefaultMaxCompressBytes);
+}
+
+static size_t OpenzlDefaultChunkBytes(ClientContext &context) {
+	return OpenzlSizeSetting(context, "openzl_chunk_size_bytes", 1000000000ULL);
+}
 
 // openzl_decompress(input_zl, output_parquet) -> output_parquet
 //
@@ -50,7 +73,8 @@ inline void OpenzlCompressFun(DataChunk &args, ExpressionState &state, Vector &r
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
 	    input_vec, output_vec, result, args.size(), [&](string_t input_path, string_t output_path) {
 		    try {
-			    openzl_bridge::CompressParquet(input_path.GetString(), output_path.GetString());
+			    openzl_bridge::CompressParquet(input_path.GetString(), output_path.GetString(), string(), 9,
+					                                OpenzlMaxCompressBytes(state.GetContext()));
 		    } catch (const openzl_bridge::Error &e) {
 			    throw IOException(e.what());
 		    }
@@ -85,7 +109,8 @@ inline void OpenzlCompressWithOptionsFun(DataChunk &args, ExpressionState &state
 			}
 		}
 		try {
-			openzl_bridge::CompressParquet(input_path, output_path, trained_path, compression_level);
+			openzl_bridge::CompressParquet(input_path, output_path, trained_path, compression_level,
+			                                OpenzlMaxCompressBytes(state.GetContext()));
 		} catch (const openzl_bridge::Error &e) {
 			throw IOException(e.what());
 		}
@@ -122,12 +147,25 @@ inline void OpenzlCompressWithBlobOptionsFun(DataChunk &args, ExpressionState &s
 		}
 		try {
 			openzl_bridge::CompressParquetWithCompressorBytes(input_path, output_path, compressor_bytes,
-			                                                   compression_level);
+			                                                   compression_level,
+			                                                   OpenzlMaxCompressBytes(state.GetContext()));
 		} catch (const openzl_bridge::Error &e) {
 			throw IOException(e.what());
 		}
 		result.SetValue(i, Value(output_path));
 	}
+}
+
+// openzl_chunk_count(path) -> BIGINT: number of independent parquet chunks in
+// an archive (1 for an ordinary single-frame archive).
+inline void OpenzlChunkCountFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	UnaryExecutor::Execute<string_t, int64_t>(args.data[0], result, args.size(), [&](string_t path) {
+		try {
+			return static_cast<int64_t>(openzl_bridge::ChunkCount(path.GetString()));
+		} catch (const openzl_bridge::Error &e) {
+			throw IOException(e.what());
+		}
+	});
 }
 
 // read_openzl(path) -> table
@@ -325,14 +363,17 @@ struct OpenzlCopyBindData : public FunctionData {
 	int compression_level = 9;
 	// If true, parquet's own writer stages into an in-memory buffer
 	// (OpenzlBufferFileSystem) instead of a real temp file on disk -- see
-	// OpenzlCopyInitGlobal/OpenzlCopyFinalize. Default false: unlike the read
-	// side (always safe, since decompressed output must already fit in
-	// memory to be usable), staging in memory holds the *entire* canonical
-	// parquet for the table/query being copied at once, whereas on-disk
-	// staging streams it through the OS instead -- opt-in given that
-	// tradeoff, even though it's bounded by the same ~2GiB compression
-	// ceiling either way (see README's "Known limitations").
+	// OpenzlCopyInitGlobal/OpenzlCopyFinalize. Default false: staging in
+	// memory holds the whole current chunk's canonical parquet at once,
+	// whereas on-disk staging streams it through the OS instead.
 	bool in_memory = false;
+	// Start a new independent chunk once the staged parquet reaches this many
+	// bytes (0 = never: one chunk, subject to openzl_max_compress_bytes).
+	// Bounds peak memory to ~4x chunk size regardless of table size. Defaults
+	// to the openzl_chunk_size_bytes setting; the CHUNK_SIZE_BYTES option
+	// overrides it per COPY.
+	size_t chunk_size_bytes = 0;
+	size_t max_compress_bytes = openzl_bridge::kDefaultMaxCompressBytes;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<OpenzlCopyBindData>();
@@ -341,13 +382,16 @@ struct OpenzlCopyBindData : public FunctionData {
 		result->trained_compressor_path = trained_compressor_path;
 		result->compression_level = compression_level;
 		result->in_memory = in_memory;
+		result->chunk_size_bytes = chunk_size_bytes;
+		result->max_compress_bytes = max_compress_bytes;
 		return std::move(result);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<OpenzlCopyBindData>();
 		return parquet_bind_data->Equals(*other.parquet_bind_data) &&
 		       trained_compressor_path == other.trained_compressor_path &&
-		       compression_level == other.compression_level && in_memory == other.in_memory;
+		       compression_level == other.compression_level && in_memory == other.in_memory &&
+		       chunk_size_bytes == other.chunk_size_bytes && max_compress_bytes == other.max_compress_bytes;
 	}
 };
 
@@ -355,6 +399,14 @@ struct OpenzlCopyGlobalState : public GlobalFunctionData {
 	string tmp_parquet_path;
 	string final_zl_path;
 	unique_ptr<GlobalFunctionData> parquet_global_state;
+	// Set once the sink has started the parquet writer's first chunk; chunks
+	// are appended here as each one is compressed (see OpenzlRotateChunk).
+	unique_ptr<openzl_bridge::ChunkedArchiveWriter> archive;
+	// Parquet-staging state for the chunk currently being written. Only ever
+	// touched from the single sink thread (a null execution_mode makes DuckDB
+	// use the non-parallel COPY sink), except the very first init.
+	idx_t chunk_index = 0;
+	bool current_chunk_open = false;
 };
 
 struct OpenzlCopyLocalState : public LocalFunctionData {
@@ -394,30 +446,110 @@ static unique_ptr<FunctionData> OpenzlCopyBind(ClientContext &context, CopyFunct
 	if (in_memory_it != input.info.options.end() && !in_memory_it->second.empty()) {
 		result->in_memory = in_memory_it->second[0].GetValue<bool>();
 	}
+	result->chunk_size_bytes = OpenzlDefaultChunkBytes(context);
+	auto chunk_it = input.info.options.find("chunk_size_bytes");
+	if (chunk_it != input.info.options.end() && !chunk_it->second.empty()) {
+		auto v = chunk_it->second[0].GetValue<int64_t>();
+		if (v < 0) {
+			throw BinderException("CHUNK_SIZE_BYTES must be >= 0 (0 disables chunking)");
+		}
+		result->chunk_size_bytes = static_cast<size_t>(v);
+	}
+	result->max_compress_bytes = OpenzlMaxCompressBytes(context);
 	return std::move(result);
+}
+
+// Starts a fresh parquet staging target + global state for the next chunk.
+static void OpenzlStartChunk(ClientContext &context, OpenzlCopyBindData &bind_data, OpenzlCopyGlobalState &gstate) {
+	// `final_zl_path` is whatever the framework decided the real output path
+	// is for this run (it may be a "tmp_"-prefixed sibling if it plans to
+	// rename over an existing file atomically after we return successfully).
+	// Stage parquet's own output under a distinct suffix next to it. Chunks
+	// are staged one at a time, so the same staging path is reused.
+	// IN_MEMORY: stage into a buffer under the "openzl-buffer://" scheme
+	// instead of a real file -- parquet's writer doesn't know the difference,
+	// since it opens whatever path we hand it via the database's normal
+	// (dispatching) filesystem either way.
+	gstate.tmp_parquet_path = bind_data.in_memory ? OpenzlBufferFileSystem::GenerateUniquePath()
+	                                               : gstate.final_zl_path + ".openzl_staging.parquet";
+	gstate.parquet_global_state = bind_data.parquet_copy_function.copy_to_initialize_global(
+	    context, *bind_data.parquet_bind_data, gstate.tmp_parquet_path);
+	gstate.current_chunk_open = true;
+}
+
+// Finishes the current chunk's parquet file, OpenZL-compresses it and appends
+// the frame to the archive; removes the staging file/buffer either way.
+static void OpenzlEndChunk(ClientContext &context, OpenzlCopyBindData &bind_data, OpenzlCopyGlobalState &gstate) {
+	bind_data.parquet_copy_function.copy_to_finalize(context, *bind_data.parquet_bind_data,
+	                                                  *gstate.parquet_global_state);
+	gstate.parquet_global_state.reset();
+	gstate.current_chunk_open = false;
+	std::string frame;
+	try {
+		if (bind_data.in_memory) {
+			// TakeBuffer() removes the entry regardless of what happens next.
+			std::string canonical_bytes = OpenzlBufferFileSystem::TakeBuffer(gstate.tmp_parquet_path);
+			frame = openzl_bridge::CompressParquetBytesToString(canonical_bytes, bind_data.trained_compressor_path,
+			                                                     bind_data.compression_level,
+			                                                     bind_data.max_compress_bytes);
+		} else {
+			// Read the staged file, refusing an oversized one before allocating.
+			std::string canonical_bytes;
+			{
+				std::ifstream f(gstate.tmp_parquet_path, std::ios::binary | std::ios::ate);
+				if (!f) {
+					throw openzl_bridge::Error("openzl: could not read staging file " + gstate.tmp_parquet_path);
+				}
+				auto size = static_cast<size_t>(f.tellg());
+				if (size > bind_data.max_compress_bytes) {
+					throw openzl_bridge::Error(
+					    "openzl: staged parquet chunk is " + std::to_string(size) + " bytes, over the " +
+					    std::to_string(bind_data.max_compress_bytes) +
+					    "-byte compress limit; lower CHUNK_SIZE_BYTES / openzl_chunk_size_bytes, or raise "
+					    "SET openzl_max_compress_bytes.");
+				}
+				canonical_bytes.resize(size);
+				f.seekg(0);
+				f.read(&canonical_bytes[0], static_cast<std::streamsize>(size));
+			}
+			frame = openzl_bridge::CompressParquetBytesToString(canonical_bytes, bind_data.trained_compressor_path,
+			                                                     bind_data.compression_level,
+			                                                     bind_data.max_compress_bytes);
+		}
+	} catch (const openzl_bridge::Error &e) {
+		if (!bind_data.in_memory) {
+			std::remove(gstate.tmp_parquet_path.c_str());
+		}
+		throw IOException(e.what());
+	}
+	if (!bind_data.in_memory) {
+		std::remove(gstate.tmp_parquet_path.c_str());
+	}
+	try {
+		gstate.archive->Append(frame);
+	} catch (const openzl_bridge::Error &e) {
+		throw IOException(e.what());
+	}
+	gstate.chunk_index++;
+}
+
+// Current staged size of the chunk in progress (bytes the parquet writer has
+// flushed so far; a row group's worth may still be buffered in memory).
+static size_t OpenzlStagedBytes(OpenzlCopyBindData &bind_data, OpenzlCopyGlobalState &gstate) {
+	if (bind_data.in_memory) {
+		return OpenzlBufferFileSystem::PeekSize(gstate.tmp_parquet_path);
+	}
+	std::ifstream f(gstate.tmp_parquet_path, std::ios::binary | std::ios::ate);
+	return f ? static_cast<size_t>(f.tellg()) : 0;
 }
 
 static unique_ptr<GlobalFunctionData> OpenzlCopyInitGlobal(ClientContext &context, FunctionData &bind_data_p,
                                                             const string &file_path) {
 	auto &bind_data = bind_data_p.Cast<OpenzlCopyBindData>();
 	auto result = make_uniq<OpenzlCopyGlobalState>();
-	// `file_path` here is whatever the framework decided the real output path
-	// is for this run (it may be a "tmp_"-prefixed sibling if it plans to
-	// rename over an existing file atomically after we return successfully).
-	// Stage parquet's own output under a distinct suffix next to it, and
-	// point our OpenZL output at `file_path` itself, so that path -- whatever
-	// it is -- ends up holding a valid .zl archive exactly when the framework
-	// expects one to be there.
 	result->final_zl_path = file_path;
-	// IN_MEMORY: stage into a buffer under the "openzl-buffer://" scheme
-	// (OpenzlBufferFileSystem) instead of a real file next to the
-	// destination -- parquet's writer doesn't know the difference, since it
-	// opens whatever path we hand it via the database's normal (dispatching)
-	// filesystem either way.
-	result->tmp_parquet_path = bind_data.in_memory ? OpenzlBufferFileSystem::GenerateUniquePath()
-	                                                : file_path + ".openzl_staging.parquet";
-	result->parquet_global_state = bind_data.parquet_copy_function.copy_to_initialize_global(
-	    context, *bind_data.parquet_bind_data, result->tmp_parquet_path);
+	result->archive = make_uniq<openzl_bridge::ChunkedArchiveWriter>(file_path);
+	OpenzlStartChunk(context, bind_data, *result);
 	return std::move(result);
 }
 
@@ -434,6 +566,17 @@ static void OpenzlCopySink(ExecutionContext &context, FunctionData &bind_data_p,
 	auto &bind_data = bind_data_p.Cast<OpenzlCopyBindData>();
 	auto &gstate = gstate_p.Cast<OpenzlCopyGlobalState>();
 	auto &lstate = lstate_p.Cast<OpenzlCopyLocalState>();
+	// Rotate to a new chunk *before* writing rows, so a chunk is never empty.
+	// Sinking is single-threaded (see OpenzlCopyGlobalState), so swapping the
+	// parquet global/local state here is safe.
+	if (bind_data.chunk_size_bytes > 0 && OpenzlStagedBytes(bind_data, gstate) >= bind_data.chunk_size_bytes) {
+		bind_data.parquet_copy_function.copy_to_combine(context, *bind_data.parquet_bind_data,
+		                                                 *gstate.parquet_global_state, *lstate.parquet_local_state);
+		OpenzlEndChunk(context.client, bind_data, gstate);
+		OpenzlStartChunk(context.client, bind_data, gstate);
+		lstate.parquet_local_state =
+		    bind_data.parquet_copy_function.copy_to_initialize_local(context, *bind_data.parquet_bind_data);
+	}
 	bind_data.parquet_copy_function.copy_to_sink(context, *bind_data.parquet_bind_data, *gstate.parquet_global_state,
 	                                              *lstate.parquet_local_state, input);
 }
@@ -450,29 +593,12 @@ static void OpenzlCopyCombine(ExecutionContext &context, FunctionData &bind_data
 static void OpenzlCopyFinalize(ClientContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate_p) {
 	auto &bind_data = bind_data_p.Cast<OpenzlCopyBindData>();
 	auto &gstate = gstate_p.Cast<OpenzlCopyGlobalState>();
-	bind_data.parquet_copy_function.copy_to_finalize(context, *bind_data.parquet_bind_data,
-	                                                  *gstate.parquet_global_state);
-	if (bind_data.in_memory) {
-		// TakeBuffer() removes the entry regardless of what happens next, so
-		// there's nothing further to clean up on the error path (unlike the
-		// on-disk case below, which still owns a real temp file to remove).
-		std::string canonical_bytes = OpenzlBufferFileSystem::TakeBuffer(gstate.tmp_parquet_path);
-		try {
-			openzl_bridge::CompressParquetBytes(canonical_bytes, gstate.final_zl_path, bind_data.trained_compressor_path,
-			                                     bind_data.compression_level);
-		} catch (const openzl_bridge::Error &e) {
-			throw IOException(e.what());
-		}
-		return;
-	}
+	OpenzlEndChunk(context, bind_data, gstate);
 	try {
-		openzl_bridge::CompressParquet(gstate.tmp_parquet_path, gstate.final_zl_path, bind_data.trained_compressor_path,
-		                                bind_data.compression_level);
+		gstate.archive->Finish();
 	} catch (const openzl_bridge::Error &e) {
-		std::remove(gstate.tmp_parquet_path.c_str());
 		throw IOException(e.what());
 	}
-	std::remove(gstate.tmp_parquet_path.c_str());
 }
 
 static CopyFunction GetOpenzlCopyFunction() {
@@ -533,6 +659,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &fs = loader.GetDatabaseInstance().GetFileSystem();
 	fs.RegisterSubSystem(make_uniq<OpenzlFileSystem>());
 	fs.RegisterSubSystem(make_uniq<OpenzlBufferFileSystem>());
+
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	config.AddExtensionOption("openzl_max_compress_bytes",
+	                          "Refuse to OpenZL-compress a single canonical-parquet input larger than this many bytes "
+	                          "(memory guard: compression peaks at ~4x the input in RAM). Default 8000000000.",
+	                          LogicalType::UBIGINT, Value::UBIGINT(openzl_bridge::kDefaultMaxCompressBytes));
+	config.AddExtensionOption("openzl_chunk_size_bytes",
+	                          "COPY ... (FORMAT OPENZL) starts a new independent chunk once the staged parquet reaches "
+	                          "this many bytes, bounding peak memory regardless of table size; 0 disables chunking. "
+	                          "Default 1000000000. Overridable per COPY with CHUNK_SIZE_BYTES.",
+	                          LogicalType::UBIGINT, Value::UBIGINT(1000000000ULL));
+
+	loader.RegisterFunction(ScalarFunction("openzl_chunk_count", {LogicalType::VARCHAR}, LogicalType::BIGINT,
+	                                        OpenzlChunkCountFun));
 
 	auto read_openzl_info = DefaultTableFunctionGenerator::CreateTableMacroInfo(OpenzlReadMacro);
 	loader.RegisterFunction(*read_openzl_info);

@@ -74,6 +74,28 @@ string OpenzlFileSystem::StripScheme(const string &fpath) {
 	return fpath.substr(SCHEME_LEN);
 }
 
+namespace {
+// "<archive>#chunk=N" addresses chunk N of a multi-chunk archive. Glob()
+// expands a chunked archive into one such path per chunk, so read_parquet
+// scans the chunks as ordinary separate files. Returns false (and leaves the
+// outputs untouched) if `real_path` has no such suffix.
+bool SplitChunkSuffix(const string &real_path, string &archive, idx_t &chunk) {
+	static const string marker = "#chunk=";
+	auto pos = real_path.rfind(marker);
+	if (pos == string::npos) {
+		return false;
+	}
+	auto digits = real_path.substr(pos + marker.size());
+	if (digits.empty() || digits.size() > 15 ||
+	    digits.find_first_not_of("0123456789") != string::npos) {
+		return false;
+	}
+	archive = real_path.substr(0, pos);
+	chunk = static_cast<idx_t>(std::stoull(digits));
+	return true;
+}
+} // namespace
+
 bool OpenzlFileSystem::CanHandleFile(const string &fpath) {
 	return fpath.compare(0, SCHEME_LEN, SCHEME) == 0;
 }
@@ -86,8 +108,11 @@ unique_ptr<FileHandle> OpenzlFileSystem::OpenFile(const string &path, FileOpenFl
 		                               path);
 	}
 	string real_path = StripScheme(path);
+	string archive_path = real_path;
+	idx_t chunk = 0;
+	bool is_chunk = SplitChunkSuffix(real_path, archive_path, chunk);
 	int64_t size = -1, mtime = -1;
-	StatArchive(real_path, size, mtime);
+	StatArchive(archive_path, size, mtime);
 
 	// Held across the decompression on purpose: when DuckDB opens one handle
 	// per scan thread at once, the first decompresses and the rest wait and
@@ -97,7 +122,9 @@ unique_ptr<FileHandle> OpenzlFileSystem::OpenFile(const string &path, FileOpenFl
 	std::shared_ptr<const string> data = entry.data.lock();
 	if (!data || entry.size != size || entry.mtime != mtime) {
 		try {
-			data = std::make_shared<const string>(openzl_bridge::DecompressToBuffer(real_path));
+			data = std::make_shared<const string>(
+			    is_chunk ? openzl_bridge::DecompressChunkToBuffer(archive_path, chunk)
+			             : openzl_bridge::DecompressToBuffer(archive_path));
 		} catch (const openzl_bridge::Error &e) {
 			throw IOException("OpenzlFileSystem: %s", e.what());
 		}
@@ -155,15 +182,37 @@ bool OpenzlFileSystem::FileExists(const string &filename, optional_ptr<FileOpene
 	// Cheap existence check on the real archive, without paying for a full
 	// decompress -- OpenFile() (called for the real read) will surface a
 	// clear decompression error separately if the archive is corrupt.
-	std::ifstream f(StripScheme(filename), std::ios::binary);
+	string archive_path = StripScheme(filename);
+	idx_t chunk = 0;
+	SplitChunkSuffix(StripScheme(filename), archive_path, chunk);
+	std::ifstream f(archive_path, std::ios::binary);
 	return f.good();
 }
 
 vector<OpenFileInfo> OpenzlFileSystem::Glob(const string &path, FileOpener *opener) {
-	// openzl:// paths name one archive each -- no glob patterns supported,
-	// same as there being exactly one .zl file per COPY ... FORMAT OPENZL
-	// output. read_parquet() calls Glob() to expand its input before opening
-	// files, so this just needs to hand the single path back.
+	// openzl:// paths name one archive each -- no glob patterns supported.
+	// read_parquet() calls Glob() to expand its input before opening files: a
+	// plain archive expands to itself, a multi-chunk archive to one
+	// "<path>#chunk=N" per chunk (each decompressed independently on open, so
+	// memory is bounded by the chunk size, not the table size).
+	string archive_path = StripScheme(path);
+	idx_t chunk = 0;
+	if (SplitChunkSuffix(archive_path, archive_path, chunk)) {
+		return {OpenFileInfo(path)};
+	}
+	try {
+		std::vector<openzl_bridge::ChunkRange> ranges;
+		if (std::ifstream(archive_path, std::ios::binary).good() &&
+		    openzl_bridge::ReadContainerIndex(archive_path, ranges)) {
+			vector<OpenFileInfo> result;
+			for (idx_t i = 0; i < ranges.size(); i++) {
+				result.emplace_back(path + "#chunk=" + std::to_string(i));
+			}
+			return result;
+		}
+	} catch (const openzl_bridge::Error &e) {
+		throw IOException("OpenzlFileSystem: %s", e.what());
+	}
 	return {OpenFileInfo(path)};
 }
 
@@ -187,6 +236,12 @@ std::unordered_map<string, std::shared_ptr<string>> &OpenzlBufferFileSystem::Buf
 string OpenzlBufferFileSystem::GenerateUniquePath() {
 	static std::atomic<uint64_t> counter{0};
 	return string(BUFFER_SCHEME) + std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
+}
+
+size_t OpenzlBufferFileSystem::PeekSize(const string &path) {
+	std::lock_guard<std::mutex> lock(Mutex());
+	auto it = Buffers().find(path);
+	return it == Buffers().end() ? 0 : it->second->size();
 }
 
 string OpenzlBufferFileSystem::TakeBuffer(const string &path) {

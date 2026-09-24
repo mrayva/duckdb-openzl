@@ -132,10 +132,9 @@ COPY tbl TO 'data.zl' (FORMAT OPENZL, IN_MEMORY true);
 
 The tradeoff: on-disk staging streams the canonical parquet through the OS a
 row group at a time, while `IN_MEMORY` holds the *entire* thing in RAM at
-once before compressing -- worth knowing, though in practice it's bounded by
-the same ~2GiB ceiling compression already enforces (see
-[Known limitations](#known-limitations)), so anything that would actually
-compress successfully fits in memory as staging input too. Default is
+once before compressing -- but only one *chunk* at a time (see
+[Large tables](#large-tables-automatic-chunking)), so it's bounded by the
+chunk size, not the table size. Default is
 `false` to keep existing behavior unchanged unless you opt in. See
 "How the ergonomics functions work" below for the mechanism.
 
@@ -380,18 +379,47 @@ Two build gotchas worth knowing if you touch this again:
   realistic minimum page size and adds the missing NULL check. With it, a
   2.59GB input that used to crash compresses and round-trips correctly.
   `git status` shows the submodule as modified once the patch is applied;
-  that's expected. **`CompressParquet()`'s size guard is still 2,000,000,000
-  bytes**: larger inputs haven't been validated end to end (an 18GB
-  one-shot attempt was killed for lack of RAM, not a bug), so raise
-  `kMaxCanonicalParquetBytes` once that's measured. Until then, split larger
-  tables into chunks (e.g. by row range) and compress each separately.
+  that's expected. What remains is a *memory* limit, not a format one:
+  compression peaks at roughly 4x its input in RAM (7.46GB in -> 30.7GB
+  peak). That's what `openzl_max_compress_bytes` guards (default 8GB), and
+  what chunking (next section) avoids for tables of any size.
+
+## Large tables: automatic chunking
+
+`COPY ... (FORMAT OPENZL)` bounds its memory by *chunk*, not table: once the
+staged canonical parquet reaches `openzl_chunk_size_bytes` (default 1GB) it
+compresses that chunk as its own OpenZL frame, drops the staging data, and
+starts the next. The chunks live in **one** `.zl` file (a small container: a
+magic, the frames, an index of offsets, a trailer). Peak compress RAM is
+~4x the chunk size whatever the table size (measured: 90M rows / ~5GB of
+canonical parquet -> 5 chunks, 5.7GB peak RSS end to end). A table that fits
+in one chunk still produces a plain single-frame archive, byte-identical to
+before, so existing archives and small outputs are unchanged.
+
+Reading is transparent: `read_openzl('data.zl')` expands a chunked archive
+into its chunks and DuckDB scans them like separate files, decompressing each
+on demand (peak read RAM is ~2.3x the chunk size per concurrently scanned
+chunk, i.e. it scales with `threads`, not table size).
+
+```sql
+SET openzl_chunk_size_bytes = 500000000;       -- default 1000000000; 0 = never chunk
+COPY big TO 'big.zl' (FORMAT OPENZL);            -- uses the setting
+COPY big TO 'big.zl' (FORMAT OPENZL, CHUNK_SIZE_BYTES 250000000);  -- per-COPY override
+SELECT openzl_chunk_count('big.zl');             -- 1 for a plain archive
+SET openzl_max_compress_bytes = 16000000000;     -- one-shot compress guard (default 8000000000)
+```
+
+Notes: chunk boundaries fall on parquet row-group boundaries, so a chunk can
+overshoot the target by up to a row group; each chunk is compressed
+independently (a trained compressor applies to every chunk, but there's no
+cross-chunk redundancy, so ratios are marginally lower than one whole-table
+frame); `openzl_compress()` / `openzl_decompress()` operate on a single
+parquet file and don't chunk -- `openzl_decompress` on a chunked archive
+errors and points to `read_openzl` instead.
 
 ## Deliberately not yet implemented
 
 - **A Postgres extension** reusing `openzl_bridge.{hpp,cpp}` as-is.
-- **Chunking** for tables whose canonical parquet exceeds the size guard
-  above -- would need COPY's sink/finalize logic to rotate through multiple
-  staging/output files, and `read_openzl` to transparently reassemble them.
 
 ## Building
 

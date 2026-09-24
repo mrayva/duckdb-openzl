@@ -284,3 +284,89 @@ query I
 SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_copy_trained.zl');
 ----
 1000
+
+# ---- runtime limit + automatic chunking ----
+
+# openzl_max_compress_bytes is a run-time setting: a tiny limit rejects the
+# compress with a message that names the knob; raising it lets it through.
+statement ok
+SET openzl_max_compress_bytes = 100;
+
+statement error
+SELECT openzl_compress('__TEST_DIR__/openzl_roundtrip.parquet', '__TEST_DIR__/openzl_limited.zl');
+----
+openzl_max_compress_bytes
+
+statement ok
+RESET openzl_max_compress_bytes;
+
+statement ok
+SELECT openzl_compress('__TEST_DIR__/openzl_roundtrip.parquet', '__TEST_DIR__/openzl_limited.zl');
+
+# A single-chunk archive is a plain frame.
+query I
+SELECT openzl_chunk_count('__TEST_DIR__/openzl_limited.zl');
+----
+1
+
+# COPY splits into independent chunks once the staged parquet reaches
+# CHUNK_SIZE_BYTES; read_openzl stitches them back transparently.
+statement ok
+COPY (SELECT range AS a, 'row_' || range AS b FROM range(2000000)) TO '__TEST_DIR__/openzl_chunked.zl' (FORMAT OPENZL, CHUNK_SIZE_BYTES 5000000);
+
+query I
+SELECT openzl_chunk_count('__TEST_DIR__/openzl_chunked.zl') > 1;
+----
+true
+
+query III
+SELECT count(*), sum(a), count(DISTINCT b) FROM read_openzl('__TEST_DIR__/openzl_chunked.zl');
+----
+2000000	1999999000000	2000000
+
+# Same, staging in memory.
+statement ok
+COPY (SELECT range AS a, 'row_' || range AS b FROM range(2000000)) TO '__TEST_DIR__/openzl_chunked_mem.zl' (FORMAT OPENZL, CHUNK_SIZE_BYTES 5000000, IN_MEMORY true);
+
+query II
+SELECT count(*), sum(a) FROM read_openzl('__TEST_DIR__/openzl_chunked_mem.zl');
+----
+2000000	1999999000000
+
+# A chunked archive isn't a single parquet file: the eager decompress says so.
+statement error
+SELECT openzl_decompress('__TEST_DIR__/openzl_chunked.zl', '__TEST_DIR__/x.parquet');
+----
+chunked archive
+
+# CHUNK_SIZE_BYTES 0 disables chunking; the setting supplies the default.
+statement ok
+COPY (SELECT range AS a FROM range(2000000)) TO '__TEST_DIR__/openzl_nochunk.zl' (FORMAT OPENZL, CHUNK_SIZE_BYTES 0);
+
+query I
+SELECT openzl_chunk_count('__TEST_DIR__/openzl_nochunk.zl');
+----
+1
+
+statement ok
+SET openzl_chunk_size_bytes = 2000000;
+
+statement ok
+COPY (SELECT range AS a FROM range(2000000)) TO '__TEST_DIR__/openzl_setting_chunk.zl' (FORMAT OPENZL);
+
+query I
+SELECT openzl_chunk_count('__TEST_DIR__/openzl_setting_chunk.zl') > 1;
+----
+true
+
+statement ok
+RESET openzl_chunk_size_bytes;
+
+# An empty result is still one valid (empty) archive.
+statement ok
+COPY (SELECT range AS a FROM range(10) WHERE false) TO '__TEST_DIR__/openzl_empty.zl' (FORMAT OPENZL, CHUNK_SIZE_BYTES 1000);
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_empty.zl');
+----
+0

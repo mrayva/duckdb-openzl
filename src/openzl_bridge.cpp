@@ -1,5 +1,7 @@
 #include "openzl_bridge.hpp"
 
+#include <cstdio>
+#include <cstring>
 #include <memory>
 
 #include "openzl/cpp/CCtx.hpp"
@@ -15,15 +17,195 @@
 
 namespace openzl_bridge {
 
+using internal::BuildParquetCompressor;
 using internal::FileExists;
-using internal::FileSize;
 using internal::ReadFile;
 using internal::WriteFile;
-using internal::BuildParquetCompressor;
+
+// ---- multi-chunk container ----
+
+namespace {
+
+constexpr char kContainerMagic[8] = {'O', 'Z', 'L', 'C', 'H', 'N', 'K', '1'};
+constexpr uint64_t kMagicLen = 8;
+
+void PutLE64(std::string &s, uint64_t v) {
+	for (int i = 0; i < 8; i++) {
+		s.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+	}
+}
+
+uint64_t GetLE64(const char *p) {
+	uint64_t v = 0;
+	for (int i = 0; i < 8; i++) {
+		v |= static_cast<uint64_t>(static_cast<unsigned char>(p[i])) << (8 * i);
+	}
+	return v;
+}
+
+} // namespace
+
+bool ReadContainerIndex(const std::string &path, std::vector<ChunkRange> &out) {
+	out.clear();
+	std::ifstream f(path, std::ios::binary | std::ios::ate);
+	if (!f) {
+		throw Error("openzl_bridge: could not open archive: " + path);
+	}
+	const uint64_t size = static_cast<uint64_t>(f.tellg());
+	if (size < kMagicLen + 16) {
+		return false;
+	}
+	char head[kMagicLen];
+	f.seekg(0);
+	f.read(head, kMagicLen);
+	if (!f || std::memcmp(head, kContainerMagic, kMagicLen) != 0) {
+		return false;
+	}
+	char tail[16];
+	f.seekg(static_cast<std::streamoff>(size - 16));
+	f.read(tail, 16);
+	if (!f || std::memcmp(tail + 8, kContainerMagic, kMagicLen) != 0) {
+		throw Error("openzl_bridge: corrupt chunked archive (missing trailer): " + path);
+	}
+	const uint64_t count = GetLE64(tail);
+	if (count == 0 || count > (size - kMagicLen - 16) / 16) {
+		throw Error("openzl_bridge: corrupt chunked archive (bad chunk count): " + path);
+	}
+	const uint64_t index_bytes = count * 16;
+	const uint64_t index_start = size - 16 - index_bytes;
+	std::string index(index_bytes, '\0');
+	f.seekg(static_cast<std::streamoff>(index_start));
+	f.read(&index[0], static_cast<std::streamsize>(index_bytes));
+	if (!f) {
+		throw Error("openzl_bridge: corrupt chunked archive (unreadable index): " + path);
+	}
+	for (uint64_t i = 0; i < count; i++) {
+		ChunkRange r {GetLE64(index.data() + 16 * i), GetLE64(index.data() + 16 * i + 8)};
+		if (r.offset < kMagicLen || r.offset > index_start || r.length > index_start - r.offset) {
+			throw Error("openzl_bridge: corrupt chunked archive (chunk out of range): " + path);
+		}
+		out.push_back(r);
+	}
+	return true;
+}
+
+size_t ChunkCount(const std::string &path) {
+	if (!FileExists(path)) {
+		throw Error("openzl_bridge: input file not found: " + path);
+	}
+	std::vector<ChunkRange> ranges;
+	return ReadContainerIndex(path, ranges) ? ranges.size() : 1;
+}
+
+std::string DecompressChunkToBuffer(const std::string &path, size_t index) {
+	if (!FileExists(path)) {
+		throw Error("openzl_bridge: input file not found: " + path);
+	}
+	std::vector<ChunkRange> ranges;
+	if (!ReadContainerIndex(path, ranges)) {
+		throw Error("openzl_bridge: not a chunked archive: " + path);
+	}
+	if (index >= ranges.size()) {
+		throw Error("openzl_bridge: chunk " + std::to_string(index) + " out of range (archive has " +
+		            std::to_string(ranges.size()) + ") : " + path);
+	}
+	std::string frame(ranges[index].length, '\0');
+	{
+		std::ifstream f(path, std::ios::binary);
+		f.seekg(static_cast<std::streamoff>(ranges[index].offset));
+		f.read(&frame[0], static_cast<std::streamsize>(frame.size()));
+		if (!f) {
+			throw Error("openzl_bridge: error reading chunk " + std::to_string(index) + " of " + path);
+		}
+	}
+	try {
+		openzl::DCtx dctx;
+		return dctx.decompressSerial(frame);
+	} catch (const std::exception &e) {
+		throw Error("openzl_bridge: decompress failed for chunk " + std::to_string(index) + " of " + path + ": " +
+		            e.what());
+	}
+}
+
+ChunkedArchiveWriter::ChunkedArchiveWriter(std::string path) : path_(std::move(path)) {
+}
+
+ChunkedArchiveWriter::~ChunkedArchiveWriter() {
+	if (!finished_) {
+		Abort();
+	}
+}
+
+void ChunkedArchiveWriter::Append(const std::string &compressed_frame) {
+	num_chunks_++;
+	if (num_chunks_ == 1) {
+		first_ = compressed_frame;
+		return;
+	}
+	if (num_chunks_ == 2) {
+		out_.open(path_, std::ios::binary | std::ios::trunc);
+		if (!out_) {
+			throw Error("openzl_bridge: could not open file for writing: " + path_);
+		}
+		out_.write(kContainerMagic, kMagicLen);
+		pos_ = kMagicLen;
+		ranges_.push_back({pos_, first_.size()});
+		out_.write(first_.data(), static_cast<std::streamsize>(first_.size()));
+		pos_ += first_.size();
+		first_.clear();
+		first_.shrink_to_fit();
+	}
+	ranges_.push_back({pos_, compressed_frame.size()});
+	out_.write(compressed_frame.data(), static_cast<std::streamsize>(compressed_frame.size()));
+	pos_ += compressed_frame.size();
+	if (!out_) {
+		throw Error("openzl_bridge: error writing file: " + path_);
+	}
+}
+
+void ChunkedArchiveWriter::Finish() {
+	if (num_chunks_ == 0) {
+		throw Error("openzl_bridge: cannot finish an archive with no chunks: " + path_);
+	}
+	if (num_chunks_ == 1) {
+		WriteFile(path_, first_);
+	} else {
+		std::string trailer;
+		for (const auto &r : ranges_) {
+			PutLE64(trailer, r.offset);
+			PutLE64(trailer, r.length);
+		}
+		PutLE64(trailer, ranges_.size());
+		trailer.append(kContainerMagic, kMagicLen);
+		out_.write(trailer.data(), static_cast<std::streamsize>(trailer.size()));
+		out_.close();
+		if (!out_) {
+			throw Error("openzl_bridge: error writing file: " + path_);
+		}
+	}
+	finished_ = true;
+}
+
+void ChunkedArchiveWriter::Abort() {
+	finished_ = true;
+	if (out_.is_open()) {
+		out_.close();
+		std::remove(path_.c_str());
+	}
+}
+
+// ---- decompress ----
 
 std::string DecompressToBuffer(const std::string &input_path) {
 	if (!FileExists(input_path)) {
 		throw Error("openzl_bridge: input file not found: " + input_path);
+	}
+	std::vector<ChunkRange> ranges;
+	if (ReadContainerIndex(input_path, ranges)) {
+		throw Error("openzl_bridge: " + input_path + " is a chunked archive (" + std::to_string(ranges.size()) +
+		            " independent parquet chunks), which can't be a single parquet file. Read it with "
+		            "read_openzl(), or write it out with COPY (SELECT * FROM read_openzl('...')) TO "
+		            "'out.parquet'.");
 	}
 	try {
 		std::string input = ReadFile(input_path);
@@ -40,17 +222,7 @@ void Decompress(const std::string &input_path, const std::string &output_path) {
 	WriteFile(output_path, DecompressToBuffer(input_path));
 }
 
-// Unpatched OpenZL segfaulted on canonical parquet inputs past roughly 2GB. The
-// root cause (found with gdb, not a 32-bit size limit as first guessed) was the
-// parquet lexer's token-count bound: 1 token per input byte, times
-// sizeof(ZL_ParquetToken) = 40 bytes, i.e. a scratch allocation of 40x the
-// input that fails for multi-GB files and was never checked. That's fixed by
-// patches/openzl-parquet-token-bound.patch (applied by CMakeLists.txt), which
-// compressed a 2.59GB input correctly. This guard is deliberately left at the
-// old conservative value until larger sizes have been validated end to end
-// (an 18GB attempt was killed for lack of RAM, not for a bug), so it no longer
-// reflects a known crash boundary -- raise it once that's been measured.
-constexpr size_t kMaxCanonicalParquetBytes = 2'000'000'000;
+// ---- compress ----
 
 namespace {
 
@@ -58,16 +230,21 @@ namespace {
 // full canonical-parquet bytes in memory (a public wrapper either read it
 // from a file or was handed it directly), and `compressor_bytes` empty means
 // "use the generic graph", non-empty means "deserialize this trained
-// compressor instead". `error_label` names the input in error messages
-// (a path when there is one, else something like "<in-memory input>").
-void CompressBytesImpl(const std::string &input, const std::string &error_label, const std::string &output_zl_path,
-                        const std::string &compressor_bytes, int compression_level) {
-	if (input.size() > kMaxCanonicalParquetBytes) {
-		throw Error("openzl_bridge: input parquet too large to compress safely (" + std::to_string(input.size()) +
-		            " bytes, limit " + std::to_string(kMaxCanonicalParquetBytes) +
-		            "): OpenZL's parquet compression graph crashes above roughly this size. "
-		            "Split the source table into smaller chunks (e.g. by row count) and "
-		            "compress each chunk separately.");
+// compressor instead". `error_label` names the input in error messages (a
+// path when there is one, else something like "<in-memory input>"). Returns
+// the compressed OpenZL frame; callers decide where it goes.
+[[noreturn]] void ThrowTooLarge(size_t size, size_t max_input_bytes) {
+	throw Error("openzl_bridge: input parquet too large for one compress call (" + std::to_string(size) +
+	            " bytes, limit " + std::to_string(max_input_bytes) +
+	            "): compression needs roughly 4x its input in RAM. COPY ... (FORMAT OPENZL) splits large "
+	            "tables into chunks automatically (see CHUNK_SIZE_BYTES / openzl_chunk_size_bytes); to "
+	            "compress this one file whole, raise the limit with SET openzl_max_compress_bytes.");
+}
+
+std::string CompressBytesImpl(const std::string &input, const std::string &error_label,
+                               const std::string &compressor_bytes, int compression_level, size_t max_input_bytes) {
+	if (input.size() > max_input_bytes) {
+		ThrowTooLarge(input.size(), max_input_bytes);
 	}
 	try {
 		// A trained compressor's serialized graph already encodes its own
@@ -94,8 +271,7 @@ void CompressBytesImpl(const std::string &input, const std::string &error_label,
 		cctx.setParameter(openzl::CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
 		cctx.setParameter(openzl::CParam::CompressionLevel, compression_level);
 		cctx.refCompressor(*compressor);
-		std::string output = cctx.compressSerial(input);
-		WriteFile(output_zl_path, output);
+		return cctx.compressSerial(input);
 	} catch (const Error &) {
 		throw;
 	} catch (const std::exception &e) {
@@ -104,47 +280,61 @@ void CompressBytesImpl(const std::string &input, const std::string &error_label,
 	}
 }
 
+std::string LoadCompressorFile(const std::string &trained_compressor_path) {
+	if (trained_compressor_path.empty()) {
+		return std::string();
+	}
+	if (!FileExists(trained_compressor_path)) {
+		throw Error("openzl_bridge: trained compressor file not found: " + trained_compressor_path);
+	}
+	return ReadFile(trained_compressor_path);
+}
+
 } // namespace
 
 void CompressParquet(const std::string &input_parquet_path, const std::string &output_zl_path,
-                      const std::string &trained_compressor_path, int compression_level) {
+                      const std::string &trained_compressor_path, int compression_level, size_t max_input_bytes) {
 	if (!FileExists(input_parquet_path)) {
 		throw Error("openzl_bridge: input parquet file not found: " + input_parquet_path);
 	}
-	std::string compressor_bytes;
-	if (!trained_compressor_path.empty()) {
-		if (!FileExists(trained_compressor_path)) {
-			throw Error("openzl_bridge: trained compressor file not found: " + trained_compressor_path);
-		}
-		compressor_bytes = ReadFile(trained_compressor_path);
+	std::string compressor_bytes = LoadCompressorFile(trained_compressor_path);
+	// Check the size before reading the file, so a too-large input is rejected
+	// without first allocating a buffer the size of the input.
+	if (internal::FileSize(input_parquet_path) > max_input_bytes) {
+		ThrowTooLarge(internal::FileSize(input_parquet_path), max_input_bytes);
 	}
-	CompressBytesImpl(ReadFile(input_parquet_path), input_parquet_path, output_zl_path, compressor_bytes,
-	                   compression_level);
+	WriteFile(output_zl_path, CompressBytesImpl(ReadFile(input_parquet_path), input_parquet_path, compressor_bytes,
+	                                              compression_level, max_input_bytes));
 }
 
 void CompressParquetWithCompressorBytes(const std::string &input_parquet_path, const std::string &output_zl_path,
-                                         const std::string &compressor_bytes, int compression_level) {
+                                         const std::string &compressor_bytes, int compression_level,
+                                         size_t max_input_bytes) {
 	if (!FileExists(input_parquet_path)) {
 		throw Error("openzl_bridge: input parquet file not found: " + input_parquet_path);
 	}
 	if (compressor_bytes.empty()) {
 		throw Error("openzl_bridge: compressor_bytes must be non-empty (use CompressParquet() for the generic graph)");
 	}
-	CompressBytesImpl(ReadFile(input_parquet_path), input_parquet_path, output_zl_path, compressor_bytes,
-	                   compression_level);
+	if (internal::FileSize(input_parquet_path) > max_input_bytes) {
+		ThrowTooLarge(internal::FileSize(input_parquet_path), max_input_bytes);
+	}
+	WriteFile(output_zl_path, CompressBytesImpl(ReadFile(input_parquet_path), input_parquet_path, compressor_bytes,
+	                                              compression_level, max_input_bytes));
 }
 
 void CompressParquetBytes(const std::string &canonical_parquet_bytes, const std::string &output_zl_path,
-                           const std::string &trained_compressor_path, int compression_level) {
-	std::string compressor_bytes;
-	if (!trained_compressor_path.empty()) {
-		if (!FileExists(trained_compressor_path)) {
-			throw Error("openzl_bridge: trained compressor file not found: " + trained_compressor_path);
-		}
-		compressor_bytes = ReadFile(trained_compressor_path);
-	}
-	CompressBytesImpl(canonical_parquet_bytes, "<in-memory input>", output_zl_path, compressor_bytes,
-	                   compression_level);
+                           const std::string &trained_compressor_path, int compression_level,
+                           size_t max_input_bytes) {
+	WriteFile(output_zl_path, CompressParquetBytesToString(canonical_parquet_bytes, trained_compressor_path,
+	                                                        compression_level, max_input_bytes));
+}
+
+std::string CompressParquetBytesToString(const std::string &canonical_parquet_bytes,
+                                          const std::string &trained_compressor_path, int compression_level,
+                                          size_t max_input_bytes) {
+	return CompressBytesImpl(canonical_parquet_bytes, "<in-memory input>", LoadCompressorFile(trained_compressor_path),
+	                          compression_level, max_input_bytes);
 }
 
 } // namespace openzl_bridge

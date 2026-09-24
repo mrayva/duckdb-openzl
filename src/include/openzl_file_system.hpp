@@ -147,6 +147,8 @@ public:
 	// such buffer exists (e.g. called twice, or before OpenFile was ever
 	// called for it).
 	static string TakeBuffer(const string &path);
+	// Current size in bytes of the buffer at `path` (0 if none).
+	static size_t PeekSize(const string &path);
 
 private:
 	static std::mutex &Mutex();
