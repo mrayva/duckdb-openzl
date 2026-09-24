@@ -38,7 +38,7 @@ static size_t OpenzlMaxCompressBytes(ClientContext &context) {
 }
 
 static size_t OpenzlDefaultChunkBytes(ClientContext &context) {
-	return OpenzlSizeSetting(context, "openzl_chunk_size_bytes", 1000000000ULL);
+	return OpenzlSizeSetting(context, "openzl_chunk_size_bytes", openzl_bridge::kDefaultChunkBytes);
 }
 
 // openzl_decompress(input_zl, output_parquet) -> output_parquet
@@ -663,13 +663,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption("openzl_max_compress_bytes",
 	                          "Refuse to OpenZL-compress a single canonical-parquet input larger than this many bytes "
-	                          "(memory guard: compression peaks at ~4x the input in RAM). Default 8000000000.",
+	                          "(memory guard: compression peaks at ~4x the input in RAM). Default 500000000 (OpenZL's documented per-payload limit; raising it is unsupported upstream).",
 	                          LogicalType::UBIGINT, Value::UBIGINT(openzl_bridge::kDefaultMaxCompressBytes));
 	config.AddExtensionOption("openzl_chunk_size_bytes",
 	                          "COPY ... (FORMAT OPENZL) starts a new independent chunk once the staged parquet reaches "
 	                          "this many bytes, bounding peak memory regardless of table size; 0 disables chunking. "
-	                          "Default 1000000000. Overridable per COPY with CHUNK_SIZE_BYTES.",
-	                          LogicalType::UBIGINT, Value::UBIGINT(1000000000ULL));
+	                          "Default 256000000. Overridable per COPY with CHUNK_SIZE_BYTES.",
+	                          LogicalType::UBIGINT, Value::UBIGINT(openzl_bridge::kDefaultChunkBytes));
 
 	loader.RegisterFunction(ScalarFunction("openzl_chunk_count", {LogicalType::VARCHAR}, LogicalType::BIGINT,
 	                                        OpenzlChunkCountFun));

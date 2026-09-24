@@ -29,14 +29,21 @@ struct Error : std::runtime_error {
 	using std::runtime_error::runtime_error;
 };
 
-// Default cap on the canonical-parquet size handed to ONE OpenZL compress call.
-// Compression peaks at roughly 4x its input in RAM (measured: 30.7GB for a
-// 7.46GB input), so this is a memory guard, not a format limit -- the old
-// ~2GB crash was a bug in OpenZL's parquet lexer, fixed by
-// patches/openzl-parquet-token-bound.patch. Every Compress* function takes an
-// explicit `max_input_bytes` so callers (the extension's runtime setting
-// openzl_max_compress_bytes) can override it per call.
-constexpr size_t kDefaultMaxCompressBytes = 8000000000ULL;
+// Default cap on the canonical-parquet size handed to ONE OpenZL compress call:
+// 500MB, OpenZL's documented limit (https://openzl.org/getting-started/
+// library-limitations/: "Compressing payloads with size > 500MB will result in
+// undefined behavior. Such inputs must be chunked before compression").
+// Larger inputs did round-trip correctly in our tests (up to 7.46GB, after
+// patches/openzl-parquet-token-bound.patch fixed an unrelated ~2GB lexer
+// crash), but that is outside upstream's supported range, so going past this
+// is opt-in via the runtime setting openzl_max_compress_bytes. Memory is the
+// other reason for a cap: compression peaks at roughly 4x its input in RAM
+// (measured; upstream documents up to ~10x). Every Compress* function takes an
+// explicit `max_input_bytes` so callers can override it per call.
+constexpr size_t kDefaultMaxCompressBytes = 500000000ULL;
+// Default chunk size for COPY ... FORMAT OPENZL: comfortably under the cap even
+// after a row group of overshoot; measured free in time and ratio.
+constexpr size_t kDefaultChunkBytes = 256000000ULL;
 
 // Decompresses an OpenZL archive (.zl) at `input_path` and returns the
 // decompressed bytes directly (a valid, directly queryable parquet file's

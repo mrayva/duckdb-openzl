@@ -381,13 +381,18 @@ Two build gotchas worth knowing if you touch this again:
   `git status` shows the submodule as modified once the patch is applied;
   that's expected. What remains is a *memory* limit, not a format one:
   compression peaks at roughly 4x its input in RAM (7.46GB in -> 30.7GB
-  peak). That's what `openzl_max_compress_bytes` guards (default 8GB), and
-  what chunking (next section) avoids for tables of any size.
+  peak; upstream documents up to ~10x). Separately, **OpenZL documents
+  payloads over 500MB as undefined behavior and says to chunk them first**
+  ([library limitations](https://openzl.org/getting-started/library-limitations/)).
+  Inputs up to 7.46GB round-tripped correctly in our tests, but that is
+  outside the supported range. So `openzl_max_compress_bytes` defaults to
+  500MB (raising it is opt-in), and chunking (next section) keeps every
+  compress call inside it for tables of any size.
 
 ## Large tables: automatic chunking
 
 `COPY ... (FORMAT OPENZL)` bounds its memory by *chunk*, not table: once the
-staged canonical parquet reaches `openzl_chunk_size_bytes` (default 1GB) it
+staged canonical parquet reaches `openzl_chunk_size_bytes` (default 256MB, well under the 500MB limit) it
 compresses that chunk as its own OpenZL frame, drops the staging data, and
 starts the next. The chunks live in **one** `.zl` file (a small container: a
 magic, the frames, an index of offsets, a trailer). Peak compress RAM is
@@ -396,17 +401,26 @@ canonical parquet -> 5 chunks, 5.7GB peak RSS end to end). A table that fits
 in one chunk still produces a plain single-frame archive, byte-identical to
 before, so existing archives and small outputs are unchanged.
 
+Measured on a 48.3M-row Hacker News table (6.4GB parquet), `COPY ... FORMAT
+OPENZL`, then a read-back aggregate: chunk size barely matters for time or
+ratio -- ~385-395s and a 5.91-5.96GB archive whether chunks are 10MB or
+2.7GB -- so small chunks are free. Peak RSS with `threads=1`,
+`memory_limit=256MB`: ~0.66-0.70GB write (a floor set by DuckDB and the
+parquet writer, reached at 42MB chunks) and ~0.32GB read, versus ~30GB to
+compress the same table whole. With 4 threads and chunks of budget/6: peak
+RSS 1.4 / 2.1 / 4.2 / 6.5 / 12.3GB writing at 1 / 2 / 4 / 8 / 16GB budgets.
+
 Reading is transparent: `read_openzl('data.zl')` expands a chunked archive
 into its chunks and DuckDB scans them like separate files, decompressing each
 on demand (peak read RAM is ~2.3x the chunk size per concurrently scanned
 chunk, i.e. it scales with `threads`, not table size).
 
 ```sql
-SET openzl_chunk_size_bytes = 500000000;       -- default 1000000000; 0 = never chunk
+SET openzl_chunk_size_bytes = 100000000;       -- default 256000000; 0 = never chunk
 COPY big TO 'big.zl' (FORMAT OPENZL);            -- uses the setting
 COPY big TO 'big.zl' (FORMAT OPENZL, CHUNK_SIZE_BYTES 250000000);  -- per-COPY override
 SELECT openzl_chunk_count('big.zl');             -- 1 for a plain archive
-SET openzl_max_compress_bytes = 16000000000;     -- one-shot compress guard (default 8000000000)
+SET openzl_max_compress_bytes = 2000000000;      -- one-shot compress guard (default 500000000, upstream's limit; higher is unsupported)
 ```
 
 Notes: chunk boundaries fall on parquet row-group boundaries, so a chunk can

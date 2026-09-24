@@ -238,7 +238,8 @@ namespace {
 	            " bytes, limit " + std::to_string(max_input_bytes) +
 	            "): compression needs roughly 4x its input in RAM. COPY ... (FORMAT OPENZL) splits large "
 	            "tables into chunks automatically (see CHUNK_SIZE_BYTES / openzl_chunk_size_bytes); to "
-	            "compress this one file whole, raise the limit with SET openzl_max_compress_bytes.");
+	            "compress this one file whole, raise the limit with SET openzl_max_compress_bytes (note: OpenZL documents "
+	            "payloads over 500MB as undefined behavior).");
 }
 
 std::string CompressBytesImpl(const std::string &input, const std::string &error_label,
