@@ -88,9 +88,10 @@ SELECT * FROM read_parquet('data.parquet');
 ```
 
 All four throw an `IOException` on failure (missing input, input not
-canonical, OpenZL error, etc). `COPY ... (FORMAT OPENZL)` cleans up its own
-intermediate staging file (`<path>.openzl_staging.parquet`) unconditionally,
-including on error.
+canonical, OpenZL error, etc). `COPY ... (FORMAT OPENZL)` writes no
+intermediate file by default (it stages in memory, see `IN_MEMORY` below); with
+`IN_MEMORY false` it cleans up its staging file
+(`<path>.openzl_staging.parquet`) unconditionally, including on error.
 
 `openzl_compress` and `COPY ... FORMAT OPENZL` both take an optional trained
 compressor (see [Training](#training) below) and an explicit compression
@@ -119,24 +120,22 @@ COPY tbl TO 'data.zl' (FORMAT OPENZL, TRAINED_COMPRESSOR 'nbbo.compressor', COMP
 be literal/constant at bind time, so there's no clean way to reference a
 per-query BLOB value there the way a scalar function argument can.)
 
-`COPY ... FORMAT OPENZL` also takes `IN_MEMORY` (boolean, default `false`):
-by default, the canonical parquet that parquet's own writer produces is
-staged to a real temp file next to the destination (`<path>.openzl_staging.parquet`,
-cleaned up automatically) before being compressed. `IN_MEMORY true` skips
-that file entirely -- parquet's writer is pointed at an in-memory buffer
-instead, so nothing but the final `.zl` archive ever touches disk:
+`COPY ... FORMAT OPENZL` also takes `IN_MEMORY` (boolean, default `true`):
+the canonical parquet that parquet's own writer produces is staged in an
+in-memory buffer, so nothing but the final `.zl` archive ever touches disk.
+Only the current chunk is held (see
+[Large tables](#large-tables-automatic-chunking)), so it's bounded by the
+chunk size (256MB by default), not the table size. `IN_MEMORY false` stages to
+a real temp file next to the destination (`<path>.openzl_staging.parquet`,
+cleaned up automatically) instead, streaming through the OS a row group at a
+time -- useful if you set a very large chunk size and want the staging data
+off the heap:
 
 ```sql
-COPY tbl TO 'data.zl' (FORMAT OPENZL, IN_MEMORY true);
+COPY tbl TO 'data.zl' (FORMAT OPENZL, IN_MEMORY false);
 ```
 
-The tradeoff: on-disk staging streams the canonical parquet through the OS a
-row group at a time, while `IN_MEMORY` holds the *entire* thing in RAM at
-once before compressing -- but only one *chunk* at a time (see
-[Large tables](#large-tables-automatic-chunking)), so it's bounded by the
-chunk size, not the table size. Default is
-`false` to keep existing behavior unchanged unless you opt in. See
-"How the ergonomics functions work" below for the mechanism.
+See "How the ergonomics functions work" below for the mechanism.
 
 ## Training
 
@@ -336,9 +335,9 @@ Two build gotchas worth knowing if you touch this again:
   the same single-threaded bind/sink/combine/finalize sequence every simple
   copy function supports, regardless of what other parallel/batch modes
   parquet's own copy function also implements.
-- The staging target is a real file (`<path>.openzl_staging.parquet`) unless
-  `IN_MEMORY true` is given, in which case it's a path under the
-  `"openzl-buffer://"` scheme instead -- a second virtual filesystem this
+- The staging target is a path under the
+  `"openzl-buffer://"` scheme (or, with `IN_MEMORY false`, a real file
+  `<path>.openzl_staging.parquet`) -- a second virtual filesystem this
   extension registers (`OpenzlBufferFileSystem` / `OpenzlBufferFileHandle`,
   same file as `OpenzlFileSystem` above), this one writable. Parquet's
   `ParquetWriter` gets its `FileSystem` via `FileSystem::GetFileSystem(context)`

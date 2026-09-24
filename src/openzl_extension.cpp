@@ -361,12 +361,12 @@ struct OpenzlCopyBindData : public FunctionData {
 	// '' = use the generic "parquet" graph (default).
 	string trained_compressor_path;
 	int compression_level = 9;
-	// If true, parquet's own writer stages into an in-memory buffer
-	// (OpenzlBufferFileSystem) instead of a real temp file on disk -- see
-	// OpenzlCopyInitGlobal/OpenzlCopyFinalize. Default false: staging in
-	// memory holds the whole current chunk's canonical parquet at once,
-	// whereas on-disk staging streams it through the OS instead.
-	bool in_memory = false;
+	// If true (the default), parquet's own writer stages into an in-memory
+	// buffer (OpenzlBufferFileSystem) instead of a real temp file on disk, so
+	// no intermediate file ever exists -- see OpenzlStartChunk/OpenzlEndChunk.
+	// Only the current chunk is ever held (bounded by chunk_size_bytes);
+	// IN_MEMORY false stages it in <target>.openzl_staging.parquet instead.
+	bool in_memory = true;
 	// Start a new independent chunk once the staged parquet reaches this many
 	// bytes (0 = never: one chunk, subject to openzl_max_compress_bytes).
 	// Bounds peak memory to ~4x chunk size regardless of table size. Defaults
