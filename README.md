@@ -357,23 +357,30 @@ Two build gotchas worth knowing if you touch this again:
 
 ## Known limitations
 
-- **~2GiB input ceiling.** OpenZL's parquet compression graph crashes
-  (segfault, not a clean error) on large inputs -- empirically, compression
-  succeeded at 1.94GB and crashed at 2.42GB of canonical parquet, consistent
-  with an internal 32-bit (2^31-1 byte) size limit somewhere in the graph or
-  its dependencies that isn't checked before use. `CompressParquet()` checks
-  the input file's size upfront and throws a clear `IOException` instead of
-  crashing once it's over roughly 2,000,000,000 bytes -- but that means
-  tables whose canonical parquet exceeds this size **cannot currently be
-  OpenZL-compressed at all**. This isn't a rare edge case for wide/high-row
-  tables: split such a table into smaller chunks (e.g. by row range) and
-  compress each chunk as a separate `.zl` archive; there's no chunking
-  support built into this extension yet.
+- **Compression size ceiling (root-caused, patched, guard still conservative).**
+  Unpatched OpenZL segfaulted on canonical parquet inputs past roughly 2GB.
+  The cause is *not* a 32-bit size limit (an early guess): a gdb backtrace
+  showed a NULL dereference in the parquet lexer. `ZL_ParquetLexer_maxNumTokens()`
+  assumed one token per input **byte**, and the segmenter multiplies that by
+  `sizeof(ZL_ParquetToken)` (40 bytes) to size one upfront scratch allocation
+  -- 40x the input, i.e. ~104GB for a 2.6GB file -- whose failure went
+  unchecked. Real parquet emits two tokens per data page, not per byte.
+  `patches/openzl-parquet-token-bound.patch` (applied to the vendored OpenZL
+  by `CMakeLists.txt` at configure time, since we can't push to upstream and
+  a submodule-local commit wouldn't be fetchable) bounds tokens by a
+  realistic minimum page size and adds the missing NULL check. With it, a
+  2.59GB input that used to crash compresses and round-trips correctly.
+  `git status` shows the submodule as modified once the patch is applied;
+  that's expected. **`CompressParquet()`'s size guard is still 2,000,000,000
+  bytes**: larger inputs haven't been validated end to end (an 18GB
+  one-shot attempt was killed for lack of RAM, not a bug), so raise
+  `kMaxCanonicalParquetBytes` once that's measured. Until then, split larger
+  tables into chunks (e.g. by row range) and compress each separately.
 
 ## Deliberately not yet implemented
 
 - **A Postgres extension** reusing `openzl_bridge.{hpp,cpp}` as-is.
-- **Chunking** for tables whose canonical parquet exceeds the ~2GiB limit
+- **Chunking** for tables whose canonical parquet exceeds the size guard
   above -- would need COPY's sink/finalize logic to rotate through multiple
   staging/output files, and `read_openzl` to transparently reassemble them.
 

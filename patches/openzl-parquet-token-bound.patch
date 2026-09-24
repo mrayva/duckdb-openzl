@@ -1,0 +1,79 @@
+diff --git a/custom_parsers/parquet/parquet_graph.c b/custom_parsers/parquet/parquet_graph.c
+index 7d13fbf..10aaa32 100644
+--- a/custom_parsers/parquet/parquet_graph.c
++++ b/custom_parsers/parquet/parquet_graph.c
+@@ -199,8 +199,15 @@ static ZL_Report parquetSegmenterInner(
+     ZL_TRY_LET(
+             size_t, maxNbTokens, ZL_ParquetLexer_maxNumTokens(lexer, errCtx));
+     size_t nbTokens               = 0;
++    // Defense in depth: ZL_ParquetLexer_maxNumTokens() is now a realistic
++    // (not worst-theoretical-case) bound -- see its doc comment -- so check
++    // this allocation rather than assume it always succeeds. Previously an
++    // unchecked NULL here (which reliably happened for any multi-GB input
++    // under the old byte-for-byte bound) caused a segfault several calls
++    // later in the lexer, not a clean error at the actual failure site.
+     ZL_ParquetToken* const tokens = ZL_Segmenter_getScratchSpace(
+             seg, maxNbTokens * sizeof(ZL_ParquetToken));
++    ZL_ERR_IF_NULL(tokens, allocation, "Failed to allocate parquet token scratch space");
+ 
+     ZL_ParquetToken* currTokensPtr = tokens;
+     size_t currTokensSize          = 0;
+diff --git a/custom_parsers/parquet/parquet_lexer.cpp b/custom_parsers/parquet/parquet_lexer.cpp
+index 14a7dd7..cba2b2e 100644
+--- a/custom_parsers/parquet/parquet_lexer.cpp
++++ b/custom_parsers/parquet/parquet_lexer.cpp
+@@ -382,8 +382,51 @@ ZL_Report ZL_ParquetLexer_maxNumTokens(
+         ZL_ErrorContext* errCtx)
+ {
+     ZL_RESULT_DECLARE_SCOPE_REPORT(errCtx);
+-    // TODO: Improve this estimate
+     ZL_ERR_IF_LT(lexer->srcEnd, lexer->srcBegin, GENERIC);
+-    size_t srcSize = (size_t)(lexer->srcEnd - lexer->srcBegin);
+-    return ZL_returnValue(srcSize);
++
++    // Previously this returned srcSize (1 token per BYTE of input), on the
++    // theory that it's a safe worst case. It's a *correct* worst case, but a
++    // wildly impractical one: the caller (parquetSegmenterInner in
++    // parquet_graph.c) multiplies this by sizeof(ZL_ParquetToken) (40 bytes)
++    // to size a single upfront scratch allocation, so a 1-token-per-byte
++    // bound demands 40x the input size in scratch memory alone -- 100+ GB
++    // for a multi-GB file -- and that allocation's failure was never
++    // checked, so it crashed (NULL deref in lexMagic) instead of erroring
++    // cleanly. See duckdb-openzl's README "Known limitations" for how this
++    // was found (gdb backtrace on a real multi-GB parquet file).
++    //
++    // lexOne() only ever emits 2 tokens per real event: a magic token, a
++    // footer token, and for each *data page* in the file, a pageHeader token
++    // followed by a dataPage token (repetition/definition level RLE blocks
++    // are folded into the pageHeader token's size, not separate tokens --
++    // see consumeLevelData()/lexPageHeader() above; non-data pages, i.e.
++    // dictionary pages, are rejected as errors elsewhere in this lexer, so
++    // they never contribute tokens here). So the true bound is
++    // 2 + 2 * (actual number of data pages) -- but the number of pages
++    // isn't known ahead of lexing (page boundaries live inside each column
++    // chunk's byte range, not in the file footer's metadata), so we can't
++    // compute it exactly here.
++    //
++    // Bound the page count instead via a conservative *realistic* minimum
++    // page size, matching how OpenZL's own CSV segmenter fix (facebook/openzl
++    // PR #718) chose "worst realistic case" over "worst theoretical case" for
++    // an analogous estimate. No parquet writer producing pages anywhere near
++    // this small exists in practice (real writers default to tens of KB to
++    // low MB per page) -- if one ever did, ZL_Segmenter_getScratchSpace's
++    // result is still checked for NULL below (see parquet_graph.c) rather
++    // than blindly trusted, so an unexpectedly page-dense file fails cleanly
++    // instead of silently overrunning this buffer.
++    //
++    // Every column chunk has at least one data page no matter how small it
++    // is (a 5-row file still emits a pageHeader + dataPage token per column),
++    // so count "+ 1" page per chunk on top of the size-based term -- a
++    // purely size-based bound undercounts tiny files.
++    constexpr size_t kMinRealisticPageSize = 256;
++    size_t maxDataPages = 0;
++    for (const auto& chunk : lexer->fileMetadata->columnChunks) {
++        ZL_ERR_IF_LT(chunk.numBytes, 0, GENERIC);
++        maxDataPages += (size_t)chunk.numBytes / kMinRealisticPageSize + 1;
++    }
++    size_t maxTokens = 2 + 2 * maxDataPages;
++    return ZL_returnValue(maxTokens);
+ }

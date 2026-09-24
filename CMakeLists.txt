@@ -38,6 +38,32 @@ set(OPENZL_INSTALL OFF CACHE BOOL "" FORCE)
 # and needs (newer zstd APIs like ZSTD_reset_session_and_parameters). Prepend
 # OpenZL's own zstd headers so they win.
 include_directories(BEFORE third_party/openzl/deps/zstd/lib)
+
+# Local patch to the vendored OpenZL (we can't push to facebook/openzl, and a
+# commit inside the submodule wouldn't exist on any remote a fresh clone could
+# fetch): fixes the parquet lexer's token-scratch overallocation that crashed
+# any multi-GB input -- see patches/openzl-parquet-token-bound.patch and the
+# README's "Known limitations". Applied idempotently at configure time:
+# `git apply --check --reverse` succeeds only if it's already applied.
+set(OPENZL_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/openzl)
+set(OPENZL_PARQUET_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/patches/openzl-parquet-token-bound.patch)
+execute_process(
+  COMMAND git apply --check --reverse ${OPENZL_PARQUET_PATCH}
+  WORKING_DIRECTORY ${OPENZL_SRC_DIR}
+  RESULT_VARIABLE OPENZL_PATCH_ALREADY_APPLIED
+  OUTPUT_QUIET ERROR_QUIET)
+if(NOT OPENZL_PATCH_ALREADY_APPLIED EQUAL 0)
+  execute_process(
+    COMMAND git apply ${OPENZL_PARQUET_PATCH}
+    WORKING_DIRECTORY ${OPENZL_SRC_DIR}
+    RESULT_VARIABLE OPENZL_PATCH_RESULT
+    ERROR_VARIABLE OPENZL_PATCH_ERROR)
+  if(NOT OPENZL_PATCH_RESULT EQUAL 0)
+    message(FATAL_ERROR "Failed to apply ${OPENZL_PARQUET_PATCH} to the vendored OpenZL "
+                        "(is third_party/openzl at the pinned commit?): ${OPENZL_PATCH_ERROR}")
+  endif()
+endif()
+
 add_subdirectory(third_party/openzl EXCLUDE_FROM_ALL)
 
 # ---- Training support (openzl::training::train()) ----

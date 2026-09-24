@@ -40,13 +40,16 @@ void Decompress(const std::string &input_path, const std::string &output_path) {
 	WriteFile(output_path, DecompressToBuffer(input_path));
 }
 
-// Empirically determined: compression succeeded at 1.94GB and segfaulted at
-// 2.42GB of canonical parquet input on this OpenZL build, consistent with an
-// internal 32-bit (2^31-1 byte) size limit somewhere in the parquet graph or
-// its dependencies that isn't checked before use. This threshold is a
-// conservative cutoff below the observed crash point, not the exact boundary
-// (which wasn't worth pinning down further -- see README for how to work
-// around it: split the source table into chunks below this size).
+// Unpatched OpenZL segfaulted on canonical parquet inputs past roughly 2GB. The
+// root cause (found with gdb, not a 32-bit size limit as first guessed) was the
+// parquet lexer's token-count bound: 1 token per input byte, times
+// sizeof(ZL_ParquetToken) = 40 bytes, i.e. a scratch allocation of 40x the
+// input that fails for multi-GB files and was never checked. That's fixed by
+// patches/openzl-parquet-token-bound.patch (applied by CMakeLists.txt), which
+// compressed a 2.59GB input correctly. This guard is deliberately left at the
+// old conservative value until larger sizes have been validated end to end
+// (an 18GB attempt was killed for lack of RAM, not for a bug), so it no longer
+// reflects a known crash boundary -- raise it once that's been measured.
 constexpr size_t kMaxCanonicalParquetBytes = 2'000'000'000;
 
 namespace {
