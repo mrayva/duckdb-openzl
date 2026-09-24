@@ -55,6 +55,21 @@ SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_roundtrip.zl');
 ----
 1000
 
+# Concurrent scans share one decompressed buffer per archive (DuckDB opens one
+# file handle per scan thread; a private copy each once multiplied RAM by the
+# thread count and OOM'd a 16-thread scan of a multi-GB archive). Correctness
+# under many threads; the memory behavior itself was measured by hand.
+statement ok
+SET threads=8;
+
+query II
+SELECT count(*), sum(a) FROM read_openzl('__TEST_DIR__/openzl_roundtrip.zl');
+----
+1000	499500
+
+statement ok
+RESET threads;
+
 # COPY ... TO 'x.zl' (FORMAT OPENZL) is the single-call write path: it
 # delegates to the catalog's "parquet" copy function under the hood (staged
 # canonically, then OpenZL-compressed on finalize), so this should produce

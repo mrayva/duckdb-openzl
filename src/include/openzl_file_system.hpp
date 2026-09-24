@@ -22,12 +22,16 @@ namespace duckdb {
 
 class OpenzlFileHandle : public FileHandle {
 public:
-	OpenzlFileHandle(FileSystem &file_system, string path, FileOpenFlags flags, string decompressed_bytes);
+	OpenzlFileHandle(FileSystem &file_system, string path, FileOpenFlags flags,
+	                 std::shared_ptr<const string> decompressed_bytes);
 
 	void Close() override {
 	}
 
-	string data;
+	// Shared with every other open handle on the same archive (see
+	// OpenzlFileSystem::OpenFile): DuckDB opens one handle per scan thread,
+	// and a private copy per handle multiplied RAM by the thread count.
+	std::shared_ptr<const string> data;
 	idx_t position = 0;
 };
 
@@ -46,9 +50,9 @@ public:
 	int64_t Read(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
 
 	int64_t GetFileSize(FileHandle &handle) override;
-	// Each OpenFile() call decompresses fresh -- there's no on-disk staleness
-	// to report, so this (and GetVersionTag() below) just report "always
-	// current" rather than tracking the real archive file's mtime.
+	// The buffer is decompressed fresh whenever no handle is holding one, so
+	// there's no on-disk staleness to report: this (and GetVersionTag() below)
+	// just report "always current" rather than tracking the archive's mtime.
 	timestamp_t GetLastModifiedTime(FileHandle &handle) override;
 	string GetVersionTag(FileHandle &handle) override {
 		return string();

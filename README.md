@@ -310,9 +310,18 @@ Two build gotchas worth knowing if you touch this again:
   No intermediate `.parquet` file is ever written: an earlier revision did
   exactly that (decompress to a sibling file, then `read_parquet` it back)
   and paid for a real disk round-trip on every read; see git history if
-  that's of interest. Each call re-decompresses from scratch (there's no
-  cross-call caching of the buffer), so repeated reads of the same archive
-  cost repeated decompression CPU, not repeated disk I/O.
+  that's of interest. DuckDB opens one file handle per scan thread, so
+  the decompressed buffer is shared between all concurrently-open handles
+  on the same archive (a `weak_ptr` cache keyed by path + size + mtime in
+  `OpenzlFileSystem::OpenFile`): the first handle decompresses, the rest
+  wait and reuse it, and it's freed when the last handle closes. There's no
+  cross-query cache, so each query still pays one decompression. An earlier
+  revision gave every handle a private copy, which multiplied peak RAM by
+  the thread count -- 3.2 / 9.8 / 35.6GB at 1 / 4 / 16 threads for a ~1GB
+  archive, and an OOM-killed machine on a 7.4GB one. Now it's flat (2.2GB at
+  every thread count for that same ~1GB archive). Peak RAM is still roughly
+  2x the decompressed size (compressed bytes + decompressed bytes are both
+  resident during decompression), so a multi-GB archive needs multi-GB RAM.
 - `COPY ... (FORMAT OPENZL)` is a real `CopyFunction`, but it doesn't
   reimplement a parquet writer: its bind looks up the catalog's own
   registered `"parquet"` `CopyFunctionCatalogEntry`

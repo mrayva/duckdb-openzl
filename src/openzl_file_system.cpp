@@ -5,6 +5,13 @@
 #include <fstream>
 
 #include <atomic>
+#include <mutex>
+#include <unordered_map>
+#ifdef _WIN32
+#include <sys/stat.h>
+#else
+#include <sys/stat.h>
+#endif
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/timestamp.hpp"
@@ -22,9 +29,46 @@ constexpr size_t BUFFER_SCHEME_LEN = 16; // strlen("openzl-buffer://")
 } // namespace
 
 OpenzlFileHandle::OpenzlFileHandle(FileSystem &file_system, string path, FileOpenFlags flags,
-                                    string decompressed_bytes)
+                                    std::shared_ptr<const string> decompressed_bytes)
     : FileHandle(file_system, std::move(path), flags), data(std::move(decompressed_bytes)) {
 }
+
+namespace {
+// One decompressed buffer per archive, shared by every concurrently-open
+// handle on it. Entries are weak: the buffer lives exactly as long as some
+// handle (or scan) holds it, then is freed -- there's no cross-query cache.
+// Keyed by the archive's size+mtime too, so a rewritten archive is never
+// served from a stale buffer that an old handle happens to still hold.
+struct ArchiveCacheEntry {
+	std::weak_ptr<const string> data;
+	int64_t size = -1;
+	int64_t mtime = -1;
+};
+std::mutex &ArchiveCacheMutex() {
+	static std::mutex m;
+	return m;
+}
+std::unordered_map<string, ArchiveCacheEntry> &ArchiveCache() {
+	static std::unordered_map<string, ArchiveCacheEntry> cache;
+	return cache;
+}
+bool StatArchive(const string &path, int64_t &size, int64_t &mtime) {
+#ifdef _WIN32
+	struct _stat64 st;
+	if (_stat64(path.c_str(), &st) != 0) {
+		return false;
+	}
+#else
+	struct stat st;
+	if (stat(path.c_str(), &st) != 0) {
+		return false;
+	}
+#endif
+	size = static_cast<int64_t>(st.st_size);
+	mtime = static_cast<int64_t>(st.st_mtime);
+	return true;
+}
+} // namespace
 
 string OpenzlFileSystem::StripScheme(const string &fpath) {
 	return fpath.substr(SCHEME_LEN);
@@ -42,37 +86,50 @@ unique_ptr<FileHandle> OpenzlFileSystem::OpenFile(const string &path, FileOpenFl
 		                               path);
 	}
 	string real_path = StripScheme(path);
-	string decompressed;
-	try {
-		decompressed = openzl_bridge::DecompressToBuffer(real_path);
-	} catch (const openzl_bridge::Error &e) {
-		throw IOException("OpenzlFileSystem: %s", e.what());
+	int64_t size = -1, mtime = -1;
+	StatArchive(real_path, size, mtime);
+
+	// Held across the decompression on purpose: when DuckDB opens one handle
+	// per scan thread at once, the first decompresses and the rest wait and
+	// then share its buffer, instead of every thread decompressing its own.
+	std::lock_guard<std::mutex> lock(ArchiveCacheMutex());
+	auto &entry = ArchiveCache()[real_path];
+	std::shared_ptr<const string> data = entry.data.lock();
+	if (!data || entry.size != size || entry.mtime != mtime) {
+		try {
+			data = std::make_shared<const string>(openzl_bridge::DecompressToBuffer(real_path));
+		} catch (const openzl_bridge::Error &e) {
+			throw IOException("OpenzlFileSystem: %s", e.what());
+		}
+		entry.data = data;
+		entry.size = size;
+		entry.mtime = mtime;
 	}
-	return make_uniq<OpenzlFileHandle>(*this, path, flags, std::move(decompressed));
+	return make_uniq<OpenzlFileHandle>(*this, path, flags, std::move(data));
 }
 
 void OpenzlFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto &h = handle.Cast<OpenzlFileHandle>();
-	if (location + nr_bytes > h.data.size()) {
+	if (location + nr_bytes > h.data->size()) {
 		throw IOException("OpenzlFileSystem: attempted to read past the end of decompressed archive \"%s\"",
 		                   handle.GetPath());
 	}
-	memcpy(buffer, h.data.data() + location, static_cast<size_t>(nr_bytes));
+	memcpy(buffer, h.data->data() + location, static_cast<size_t>(nr_bytes));
 }
 
 int64_t OpenzlFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	auto &h = handle.Cast<OpenzlFileHandle>();
-	idx_t remaining = h.data.size() > h.position ? h.data.size() - h.position : 0;
+	idx_t remaining = h.data->size() > h.position ? h.data->size() - h.position : 0;
 	idx_t to_read = std::min<idx_t>(remaining, static_cast<idx_t>(nr_bytes));
 	if (to_read > 0) {
-		memcpy(buffer, h.data.data() + h.position, to_read);
+		memcpy(buffer, h.data->data() + h.position, to_read);
 		h.position += to_read;
 	}
 	return static_cast<int64_t>(to_read);
 }
 
 int64_t OpenzlFileSystem::GetFileSize(FileHandle &handle) {
-	return static_cast<int64_t>(handle.Cast<OpenzlFileHandle>().data.size());
+	return static_cast<int64_t>(handle.Cast<OpenzlFileHandle>().data->size());
 }
 
 timestamp_t OpenzlFileSystem::GetLastModifiedTime(FileHandle &handle) {
