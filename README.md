@@ -17,7 +17,8 @@ extension's own CMake configuration.
 
 The bridge has **no DuckDB dependency** on purpose: the same translation unit
 is meant to be reusable as-is by a future Postgres extension. Callers only
-see `openzl_bridge::Decompress(...)` / `CompressParquet(...)`.
+see `openzl_bridge::Decompress(...)` / `DecompressToBuffer(...)` /
+`CompressParquet(...)`.
 
 (An earlier revision of this extension shelled out to the `zli` CLI tool as a
 proof of concept, mirroring how the `wireduck` extension shells out to
@@ -61,13 +62,16 @@ LOAD 'openzl';
 -- function, staged to a sibling temp file) and OpenZL-compresses in one COPY.
 COPY tbl TO 'data.zl' (FORMAT OPENZL);
 
--- Single-call read: decompresses to a sibling .parquet file and reads it.
+-- Single-call read: decompresses straight into memory and reads it back --
+-- no intermediate .parquet file ever touches disk (see "How the ergonomics
+-- functions work" below for how).
 SELECT * FROM read_openzl('data.zl');
 ```
 
-Lower-level, two-step equivalents are also available (what `FORMAT OPENZL` and
-`read_openzl` are built on top of), useful when you want to control the
-intermediate parquet file's location or inspect it directly:
+Lower-level, two-step equivalents are also available (what `FORMAT OPENZL` is
+built on top of, and what `read_openzl` used to be built on before it moved
+to the in-memory approach above), useful when you want an actual `.parquet`
+file on disk to inspect or hand to something else:
 
 ```sql
 -- Write already-canonical parquet, then OpenZL-compress it.
@@ -76,22 +80,17 @@ COPY tbl TO 'staging.parquet'
   (FORMAT PARQUET, COMPRESSION 'uncompressed', DICTIONARY_SIZE_LIMIT 0);
 SELECT openzl_compress('staging.parquet', 'data.zl');
 
--- Decompress an OpenZL archive back into a plain, queryable parquet file.
+-- Decompress an OpenZL archive into a real, plain, queryable parquet file
+-- on disk (unlike read_openzl, this one actually writes a file, at
+-- whatever exact path you give it).
 SELECT openzl_decompress('data.zl', 'data.parquet');
 SELECT * FROM read_parquet('data.parquet');
 ```
 
 All four throw an `IOException` on failure (missing input, input not
-canonical, OpenZL error, etc). `read_openzl` and `openzl_decompress` write
-their decompressed `.parquet` file to a deterministic sibling path (stripping
-a trailing `.zl`, or appending `.parquet`) rather than a fresh temp file per
-call: repeat calls reuse/overwrite it instead of accumulating files on disk,
-which matters given how often disk space has been this project's actual
-constraint. That means concurrent calls against the *same* archive path race
-on that sibling file -- fine for the single-user/analytical use this
-extension targets, but worth knowing. `COPY ... (FORMAT OPENZL)` cleans up
-its own intermediate staging file (`<path>.openzl_staging.parquet`)
-unconditionally, including on error.
+canonical, OpenZL error, etc). `COPY ... (FORMAT OPENZL)` cleans up its own
+intermediate staging file (`<path>.openzl_staging.parquet`) unconditionally,
+including on error.
 
 `openzl_compress` and `COPY ... FORMAT OPENZL` both take an optional trained
 compressor (see [Training](#training) below) and an explicit compression
@@ -276,11 +275,24 @@ Two build gotchas worth knowing if you touch this again:
 
 ## How the ergonomics functions work
 
-- `read_openzl(path)` is a DuckDB table macro (`DefaultTableFunctionGenerator::CreateTableMacroInfo`),
-  registered in C++ rather than via a SQL string executed at load time. Its
-  body is literally `SELECT * FROM read_parquet(openzl_decompress(path, ...))`
-  -- it doesn't need a dedicated table function implementation, just macro
-  expansion over the two functions that already existed.
+- `read_openzl(path)` is a DuckDB table macro
+  (`DefaultTableFunctionGenerator::CreateTableMacroInfo`) whose body is
+  literally `SELECT * FROM read_parquet('openzl://' || path)`.
+  `openzl://` is a virtual filesystem this extension registers
+  (`src/openzl_file_system.{hpp,cpp}`, `OpenzlFileSystem` /
+  `OpenzlFileHandle`) via `FileSystem::RegisterSubSystem` on the database's
+  top-level filesystem at load time -- the same mechanism extensions like
+  `httpfs` use to handle `s3://`/`https://`. Opening `openzl://data.zl`
+  strips the scheme, decompresses `data.zl` into an in-memory buffer
+  (`openzl_bridge::DecompressToBuffer`), and serves all subsequent
+  reads/seeks directly against that buffer (`OpenzlFileHandle::data`) --
+  DuckDB's own parquet reader has no idea it isn't reading a real file.
+  No intermediate `.parquet` file is ever written: an earlier revision did
+  exactly that (decompress to a sibling file, then `read_parquet` it back)
+  and paid for a real disk round-trip on every read; see git history if
+  that's of interest. Each call re-decompresses from scratch (there's no
+  cross-call caching of the buffer), so repeated reads of the same archive
+  cost repeated decompression CPU, not repeated disk I/O.
 - `COPY ... (FORMAT OPENZL)` is a real `CopyFunction`, but it doesn't
   reimplement a parquet writer: its bind looks up the catalog's own
   registered `"parquet"` `CopyFunctionCatalogEntry`

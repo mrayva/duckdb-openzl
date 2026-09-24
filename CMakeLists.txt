@@ -75,7 +75,7 @@ set_source_files_properties(
 target_link_libraries(openzl_training PUBLIC openzl openzl_cpp custom_parsers)
 add_dependencies(openzl_training openzl openzl_cpp custom_parsers)
 
-set(EXTENSION_SOURCES src/openzl_extension.cpp src/openzl_bridge.cpp src/openzl_train_bridge.cpp)
+set(EXTENSION_SOURCES src/openzl_extension.cpp src/openzl_bridge.cpp src/openzl_train_bridge.cpp src/openzl_file_system.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

@@ -2,6 +2,7 @@
 
 #include "openzl_extension.hpp"
 #include "openzl_bridge.hpp"
+#include "openzl_file_system.hpp"
 #include "openzl_train_bridge.hpp"
 
 #include "duckdb.hpp"
@@ -131,21 +132,21 @@ inline void OpenzlCompressWithBlobOptionsFun(DataChunk &args, ExpressionState &s
 
 // read_openzl(path) -> table
 //
-// Single-call replacement for read_parquet(openzl_decompress(...)): decompresses
-// the archive to a sibling .parquet file (stripping a trailing .zl, or just
-// appending .parquet if there isn't one) and reads it back. Typical usage:
+// Single-call read: decompresses the archive straight into memory and reads
+// it back through DuckDB's own parquet reader, with no intermediate
+// .parquet file ever touching disk. Typical usage:
 //   SELECT * FROM read_openzl('data.zl');
 //
-// The decompressed .parquet file is left on disk at a deterministic path (not
-// cleaned up, and not uniquely named per call): re-running the same query
-// reuses/overwrites it rather than accumulating temp files, which matters for
-// this project given how often disk space has been the actual constraint.
-// That means concurrent read_openzl() calls against the *same* archive path
-// can race on the same sibling file -- fine for the single-user/analytical
-// use this extension targets, but worth knowing.
-static const DefaultTableMacro OpenzlReadMacro = {
-    DEFAULT_SCHEMA, "read_openzl", {"path", nullptr}, {{nullptr, nullptr}},
-    R"(SELECT * FROM read_parquet(openzl_decompress(path, regexp_replace(path, '\.zl$', '') || '.parquet')))"};
+// Built on the "openzl://" virtual filesystem (openzl_file_system.hpp),
+// registered below: read_parquet('openzl://data.zl') opens that scheme,
+// which decompresses "data.zl" into an in-memory buffer
+// (openzl_bridge::DecompressToBuffer) and serves reads directly from it --
+// the same mechanism extensions like httpfs use for "s3://"/"https://".
+// Each call re-decompresses (no cross-call caching), so repeated reads of
+// the same archive cost repeated decompression, not repeated disk I/O.
+static const DefaultTableMacro OpenzlReadMacro = {DEFAULT_SCHEMA, "read_openzl", {"path", nullptr},
+                                                   {{nullptr, nullptr}},
+                                                   R"(SELECT * FROM read_parquet('openzl://' || path))"};
 
 // openzl_train(sample_paths, output_path[, named options...]) -> table
 //
@@ -490,6 +491,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	compress_trained_blob_level.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	openzl_compress_set.AddFunction(compress_trained_blob_level);
 	loader.RegisterFunction(openzl_compress_set);
+
+	// Registers the "openzl://" scheme (see openzl_file_system.hpp) that
+	// read_openzl's macro body opens -- same mechanism httpfs uses for
+	// "s3://"/"https://".
+	loader.GetDatabaseInstance().GetFileSystem().RegisterSubSystem(make_uniq<OpenzlFileSystem>());
 
 	auto read_openzl_info = DefaultTableFunctionGenerator::CreateTableMacroInfo(OpenzlReadMacro);
 	loader.RegisterFunction(*read_openzl_info);

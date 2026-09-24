@@ -24,6 +24,15 @@ struct Error : std::runtime_error {
 	using std::runtime_error::runtime_error;
 };
 
+// Decompresses an OpenZL archive (.zl) at `input_path` and returns the
+// decompressed bytes directly (a valid, directly queryable parquet file's
+// bytes -- OpenZL's "parquet" profile only ever compresses already-canonical
+// parquet, so no re-encoding step is needed on the way back). Used by
+// OpenzlFileSystem (openzl_file_system.hpp) to serve read_openzl() straight
+// from memory, with no intermediate .parquet file ever touching disk.
+// Throws openzl_bridge::Error on failure.
+std::string DecompressToBuffer(const std::string &input_path);
+
 // Decompresses an OpenZL archive (.zl) at `input_path` into `output_path`.
 // Since the OpenZL "parquet" profile compresses a *canonical* (uncompressed,
 // plain-encoded) parquet file, the decompressed bytes ARE a valid, directly

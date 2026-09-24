@@ -21,20 +21,23 @@ using internal::ReadFile;
 using internal::WriteFile;
 using internal::BuildParquetCompressor;
 
-void Decompress(const std::string &input_path, const std::string &output_path) {
+std::string DecompressToBuffer(const std::string &input_path) {
 	if (!FileExists(input_path)) {
 		throw Error("openzl_bridge: input file not found: " + input_path);
 	}
 	try {
 		std::string input = ReadFile(input_path);
 		openzl::DCtx dctx;
-		std::string output = dctx.decompressSerial(input);
-		WriteFile(output_path, output);
+		return dctx.decompressSerial(input);
 	} catch (const Error &) {
 		throw;
 	} catch (const std::exception &e) {
 		throw Error(std::string("openzl_bridge: decompress failed for ") + input_path + ": " + e.what());
 	}
+}
+
+void Decompress(const std::string &input_path, const std::string &output_path) {
+	WriteFile(output_path, DecompressToBuffer(input_path));
 }
 
 // Empirically determined: compression succeeded at 1.94GB and segfaulted at
