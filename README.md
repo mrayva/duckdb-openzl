@@ -119,6 +119,26 @@ COPY tbl TO 'data.zl' (FORMAT OPENZL, TRAINED_COMPRESSOR 'nbbo.compressor', COMP
 be literal/constant at bind time, so there's no clean way to reference a
 per-query BLOB value there the way a scalar function argument can.)
 
+`COPY ... FORMAT OPENZL` also takes `IN_MEMORY` (boolean, default `false`):
+by default, the canonical parquet that parquet's own writer produces is
+staged to a real temp file next to the destination (`<path>.openzl_staging.parquet`,
+cleaned up automatically) before being compressed. `IN_MEMORY true` skips
+that file entirely -- parquet's writer is pointed at an in-memory buffer
+instead, so nothing but the final `.zl` archive ever touches disk:
+
+```sql
+COPY tbl TO 'data.zl' (FORMAT OPENZL, IN_MEMORY true);
+```
+
+The tradeoff: on-disk staging streams the canonical parquet through the OS a
+row group at a time, while `IN_MEMORY` holds the *entire* thing in RAM at
+once before compressing -- worth knowing, though in practice it's bounded by
+the same ~2GiB ceiling compression already enforces (see
+[Known limitations](#known-limitations)), so anything that would actually
+compress successfully fits in memory as staging input too. Default is
+`false` to keep existing behavior unchanged unless you opt in. See
+"How the ergonomics functions work" below for the mechanism.
+
 ## Training
 
 OpenZL's generic "parquet" graph (what every call above uses by default) is
@@ -300,14 +320,33 @@ Two build gotchas worth knowing if you touch this again:
   `CopyFunction` struct (forcing `compression=uncompressed`,
   `dictionary_size_limit=0` in the `CopyInfo` passed to *its* bind), and then
   forwards every `copy_to_initialize_global/local/sink/combine` call straight
-  through to parquet's own function pointers, writing into a staging file
-  next to the real destination (`<path>.openzl_staging.parquet`). Only
-  `copy_to_finalize` differs: after letting parquet's own finalize close out
-  the staging file, it OpenZL-compresses that file into the real destination
-  and deletes it. `execution_mode` is left null, which defaults to
-  `REGULAR_COPY_TO_FILE` -- the same single-threaded bind/sink/combine/finalize
-  sequence every simple copy function supports, regardless of what other
-  parallel/batch modes parquet's own copy function also implements.
+  through to parquet's own function pointers, writing into a staging target
+  next to the real destination. Only `copy_to_finalize` differs: after
+  letting parquet's own finalize close out the staging target, it
+  OpenZL-compresses it into the real destination and cleans it up.
+  `execution_mode` is left null, which defaults to `REGULAR_COPY_TO_FILE` --
+  the same single-threaded bind/sink/combine/finalize sequence every simple
+  copy function supports, regardless of what other parallel/batch modes
+  parquet's own copy function also implements.
+- The staging target is a real file (`<path>.openzl_staging.parquet`) unless
+  `IN_MEMORY true` is given, in which case it's a path under the
+  `"openzl-buffer://"` scheme instead -- a second virtual filesystem this
+  extension registers (`OpenzlBufferFileSystem` / `OpenzlBufferFileHandle`,
+  same file as `OpenzlFileSystem` above), this one writable. Parquet's
+  `ParquetWriter` gets its `FileSystem` via `FileSystem::GetFileSystem(context)`
+  -- the database's own dispatching filesystem, the exact same one that
+  resolves `s3://`/`openzl://`/every other registered scheme -- so pointing
+  it at an `openzl-buffer://` path makes it write into an in-memory
+  `std::string` instead of a real file with zero changes to parquet's own
+  code; it has no idea the difference exists. Buffers live in a
+  process-wide registry keyed by path (`OpenzlBufferFileSystem::Buffers()`)
+  until `copy_to_finalize` reclaims them with `TakeBuffer()`, since
+  `copy_to_finalize` only has the path string parquet's `CopyFunction`
+  struct was given, not a handle to the buffer object itself;
+  `GenerateUniquePath()` keys each COPY's buffer uniquely so concurrent
+  copies (even across connections) can't collide. The reclaimed bytes go
+  straight to `openzl_bridge::CompressParquetBytes()` (bytes in, no file
+  read) instead of `CompressParquet()` (path in) -- otherwise identical.
 - The real destination passed to `copy_to_initialize_global` is whatever
   DuckDB's planner decided it should be for this run -- which may itself be a
   `tmp_`-prefixed sibling that DuckDB renames into place after we return

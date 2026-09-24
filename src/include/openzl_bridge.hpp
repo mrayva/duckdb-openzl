@@ -75,4 +75,15 @@ void CompressParquet(const std::string &input_parquet_path, const std::string &o
 void CompressParquetWithCompressorBytes(const std::string &input_parquet_path, const std::string &output_zl_path,
                                          const std::string &compressor_bytes, int compression_level = 9);
 
+// Same as CompressParquet(), except the *input* is passed as already-in-memory
+// canonical parquet bytes rather than a file path -- for callers who write
+// their own staging parquet to an in-memory buffer instead of a temp file on
+// disk (see OpenzlBufferFileSystem in openzl_file_system.hpp, used by
+// COPY ... FORMAT OPENZL's IN_MEMORY option). `trained_compressor_path`, if
+// non-empty, is still a file path (a compressor kept on disk) -- the two
+// concerns are independent, and there's currently no call site that needs an
+// in-memory *and* trained-as-bytes combination at once.
+void CompressParquetBytes(const std::string &canonical_parquet_bytes, const std::string &output_zl_path,
+                           const std::string &trained_compressor_path = std::string(), int compression_level = 9);
+
 } // namespace openzl_bridge

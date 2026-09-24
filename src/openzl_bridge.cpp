@@ -51,28 +51,22 @@ constexpr size_t kMaxCanonicalParquetBytes = 2'000'000'000;
 
 namespace {
 
-// Shared by CompressParquet() and CompressParquetWithCompressorBytes():
-// `compressor_bytes` empty means "use the generic graph", non-empty means
-// "deserialize this trained compressor instead" -- the two public entry
-// points differ only in how they obtain those bytes (a file path to read vs.
-// already-in-memory data from the caller).
-void CompressParquetImpl(const std::string &input_parquet_path, const std::string &output_zl_path,
-                          const std::string &compressor_bytes, int compression_level) {
-	if (!FileExists(input_parquet_path)) {
-		throw Error("openzl_bridge: input parquet file not found: " + input_parquet_path);
+// Shared by every public Compress* entry point below: `input` is already the
+// full canonical-parquet bytes in memory (a public wrapper either read it
+// from a file or was handed it directly), and `compressor_bytes` empty means
+// "use the generic graph", non-empty means "deserialize this trained
+// compressor instead". `error_label` names the input in error messages
+// (a path when there is one, else something like "<in-memory input>").
+void CompressBytesImpl(const std::string &input, const std::string &error_label, const std::string &output_zl_path,
+                        const std::string &compressor_bytes, int compression_level) {
+	if (input.size() > kMaxCanonicalParquetBytes) {
+		throw Error("openzl_bridge: input parquet too large to compress safely (" + std::to_string(input.size()) +
+		            " bytes, limit " + std::to_string(kMaxCanonicalParquetBytes) +
+		            "): OpenZL's parquet compression graph crashes above roughly this size. "
+		            "Split the source table into smaller chunks (e.g. by row count) and "
+		            "compress each chunk separately.");
 	}
 	try {
-		size_t input_size = FileSize(input_parquet_path);
-		if (input_size > kMaxCanonicalParquetBytes) {
-			throw Error("openzl_bridge: input parquet file too large to compress safely (" +
-			            std::to_string(input_size) + " bytes, limit " +
-			            std::to_string(kMaxCanonicalParquetBytes) +
-			            "): OpenZL's parquet compression graph crashes above roughly this size. "
-			            "Split the source table into smaller chunks (e.g. by row count) and "
-			            "compress each chunk separately.");
-		}
-		std::string input = ReadFile(input_parquet_path);
-
 		// A trained compressor's serialized graph already encodes its own
 		// column layout/clustering decisions; createCompressorFromSerialized
 		// re-registers whatever custom dependencies it references (e.g. the
@@ -102,7 +96,7 @@ void CompressParquetImpl(const std::string &input_parquet_path, const std::strin
 	} catch (const Error &) {
 		throw;
 	} catch (const std::exception &e) {
-		throw Error(std::string("openzl_bridge: compress failed for ") + input_parquet_path +
+		throw Error(std::string("openzl_bridge: compress failed for ") + error_label +
 		            " (is it canonical parquet? uncompressed, plain-encoded, no dictionary): " + e.what());
 	}
 }
@@ -111,6 +105,9 @@ void CompressParquetImpl(const std::string &input_parquet_path, const std::strin
 
 void CompressParquet(const std::string &input_parquet_path, const std::string &output_zl_path,
                       const std::string &trained_compressor_path, int compression_level) {
+	if (!FileExists(input_parquet_path)) {
+		throw Error("openzl_bridge: input parquet file not found: " + input_parquet_path);
+	}
 	std::string compressor_bytes;
 	if (!trained_compressor_path.empty()) {
 		if (!FileExists(trained_compressor_path)) {
@@ -118,15 +115,33 @@ void CompressParquet(const std::string &input_parquet_path, const std::string &o
 		}
 		compressor_bytes = ReadFile(trained_compressor_path);
 	}
-	CompressParquetImpl(input_parquet_path, output_zl_path, compressor_bytes, compression_level);
+	CompressBytesImpl(ReadFile(input_parquet_path), input_parquet_path, output_zl_path, compressor_bytes,
+	                   compression_level);
 }
 
 void CompressParquetWithCompressorBytes(const std::string &input_parquet_path, const std::string &output_zl_path,
                                          const std::string &compressor_bytes, int compression_level) {
+	if (!FileExists(input_parquet_path)) {
+		throw Error("openzl_bridge: input parquet file not found: " + input_parquet_path);
+	}
 	if (compressor_bytes.empty()) {
 		throw Error("openzl_bridge: compressor_bytes must be non-empty (use CompressParquet() for the generic graph)");
 	}
-	CompressParquetImpl(input_parquet_path, output_zl_path, compressor_bytes, compression_level);
+	CompressBytesImpl(ReadFile(input_parquet_path), input_parquet_path, output_zl_path, compressor_bytes,
+	                   compression_level);
+}
+
+void CompressParquetBytes(const std::string &canonical_parquet_bytes, const std::string &output_zl_path,
+                           const std::string &trained_compressor_path, int compression_level) {
+	std::string compressor_bytes;
+	if (!trained_compressor_path.empty()) {
+		if (!FileExists(trained_compressor_path)) {
+			throw Error("openzl_bridge: trained compressor file not found: " + trained_compressor_path);
+		}
+		compressor_bytes = ReadFile(trained_compressor_path);
+	}
+	CompressBytesImpl(canonical_parquet_bytes, "<in-memory input>", output_zl_path, compressor_bytes,
+	                   compression_level);
 }
 
 } // namespace openzl_bridge

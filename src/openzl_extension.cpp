@@ -323,6 +323,16 @@ struct OpenzlCopyBindData : public FunctionData {
 	// '' = use the generic "parquet" graph (default).
 	string trained_compressor_path;
 	int compression_level = 9;
+	// If true, parquet's own writer stages into an in-memory buffer
+	// (OpenzlBufferFileSystem) instead of a real temp file on disk -- see
+	// OpenzlCopyInitGlobal/OpenzlCopyFinalize. Default false: unlike the read
+	// side (always safe, since decompressed output must already fit in
+	// memory to be usable), staging in memory holds the *entire* canonical
+	// parquet for the table/query being copied at once, whereas on-disk
+	// staging streams it through the OS instead -- opt-in given that
+	// tradeoff, even though it's bounded by the same ~2GiB compression
+	// ceiling either way (see README's "Known limitations").
+	bool in_memory = false;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<OpenzlCopyBindData>();
@@ -330,13 +340,14 @@ struct OpenzlCopyBindData : public FunctionData {
 		result->parquet_bind_data = parquet_bind_data->Copy();
 		result->trained_compressor_path = trained_compressor_path;
 		result->compression_level = compression_level;
+		result->in_memory = in_memory;
 		return std::move(result);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<OpenzlCopyBindData>();
 		return parquet_bind_data->Equals(*other.parquet_bind_data) &&
 		       trained_compressor_path == other.trained_compressor_path &&
-		       compression_level == other.compression_level;
+		       compression_level == other.compression_level && in_memory == other.in_memory;
 	}
 };
 
@@ -379,6 +390,10 @@ static unique_ptr<FunctionData> OpenzlCopyBind(ClientContext &context, CopyFunct
 	if (level_it != input.info.options.end() && !level_it->second.empty()) {
 		result->compression_level = level_it->second[0].GetValue<int32_t>();
 	}
+	auto in_memory_it = input.info.options.find("in_memory");
+	if (in_memory_it != input.info.options.end() && !in_memory_it->second.empty()) {
+		result->in_memory = in_memory_it->second[0].GetValue<bool>();
+	}
 	return std::move(result);
 }
 
@@ -394,7 +409,13 @@ static unique_ptr<GlobalFunctionData> OpenzlCopyInitGlobal(ClientContext &contex
 	// it is -- ends up holding a valid .zl archive exactly when the framework
 	// expects one to be there.
 	result->final_zl_path = file_path;
-	result->tmp_parquet_path = file_path + ".openzl_staging.parquet";
+	// IN_MEMORY: stage into a buffer under the "openzl-buffer://" scheme
+	// (OpenzlBufferFileSystem) instead of a real file next to the
+	// destination -- parquet's writer doesn't know the difference, since it
+	// opens whatever path we hand it via the database's normal (dispatching)
+	// filesystem either way.
+	result->tmp_parquet_path = bind_data.in_memory ? OpenzlBufferFileSystem::GenerateUniquePath()
+	                                                : file_path + ".openzl_staging.parquet";
 	result->parquet_global_state = bind_data.parquet_copy_function.copy_to_initialize_global(
 	    context, *bind_data.parquet_bind_data, result->tmp_parquet_path);
 	return std::move(result);
@@ -431,6 +452,19 @@ static void OpenzlCopyFinalize(ClientContext &context, FunctionData &bind_data_p
 	auto &gstate = gstate_p.Cast<OpenzlCopyGlobalState>();
 	bind_data.parquet_copy_function.copy_to_finalize(context, *bind_data.parquet_bind_data,
 	                                                  *gstate.parquet_global_state);
+	if (bind_data.in_memory) {
+		// TakeBuffer() removes the entry regardless of what happens next, so
+		// there's nothing further to clean up on the error path (unlike the
+		// on-disk case below, which still owns a real temp file to remove).
+		std::string canonical_bytes = OpenzlBufferFileSystem::TakeBuffer(gstate.tmp_parquet_path);
+		try {
+			openzl_bridge::CompressParquetBytes(canonical_bytes, gstate.final_zl_path, bind_data.trained_compressor_path,
+			                                     bind_data.compression_level);
+		} catch (const openzl_bridge::Error &e) {
+			throw IOException(e.what());
+		}
+		return;
+	}
 	try {
 		openzl_bridge::CompressParquet(gstate.tmp_parquet_path, gstate.final_zl_path, bind_data.trained_compressor_path,
 		                                bind_data.compression_level);
@@ -494,8 +528,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Registers the "openzl://" scheme (see openzl_file_system.hpp) that
 	// read_openzl's macro body opens -- same mechanism httpfs uses for
-	// "s3://"/"https://".
-	loader.GetDatabaseInstance().GetFileSystem().RegisterSubSystem(make_uniq<OpenzlFileSystem>());
+	// "s3://"/"https://" -- and "openzl-buffer://", the writable in-memory
+	// scheme COPY ... FORMAT OPENZL's IN_MEMORY option stages into.
+	auto &fs = loader.GetDatabaseInstance().GetFileSystem();
+	fs.RegisterSubSystem(make_uniq<OpenzlFileSystem>());
+	fs.RegisterSubSystem(make_uniq<OpenzlBufferFileSystem>());
 
 	auto read_openzl_info = DefaultTableFunctionGenerator::CreateTableMacroInfo(OpenzlReadMacro);
 	loader.RegisterFunction(*read_openzl_info);

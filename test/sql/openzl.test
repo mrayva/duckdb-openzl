@@ -91,6 +91,33 @@ SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_copyfmt.zl');
 ----
 5
 
+# IN_MEMORY: parquet's own writer stages into an "openzl-buffer://" buffer
+# instead of a real temp file -- no staging file (of any name) should appear
+# on disk at all, not even transiently.
+statement ok
+COPY t TO '__TEST_DIR__/openzl_inmemory.zl' (FORMAT OPENZL, IN_MEMORY true);
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_inmemory.zl');
+----
+1000
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/openzl_inmemory.zl.openzl_staging.parquet');
+----
+0
+
+# IN_MEMORY produces byte-identical output to on-disk staging for the same
+# data -- both are just different routes to the same canonical parquet bytes.
+statement ok
+COPY t TO '__TEST_DIR__/openzl_ondisk_for_compare.zl' (FORMAT OPENZL, IN_MEMORY false);
+
+query I
+SELECT (SELECT content FROM read_blob('__TEST_DIR__/openzl_inmemory.zl')) =
+       (SELECT content FROM read_blob('__TEST_DIR__/openzl_ondisk_for_compare.zl'));
+----
+true
+
 # ---- openzl_train() ----
 
 statement error
