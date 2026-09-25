@@ -460,7 +460,17 @@ COPY big TO 'big.zl' (FORMAT OPENZL);            -- uses the setting
 COPY big TO 'big.zl' (FORMAT OPENZL, CHUNK_SIZE_BYTES 250000000);  -- per-COPY override
 SELECT openzl_chunk_count('big.zl');             -- 1 for a plain archive
 SET openzl_max_compress_bytes = 2000000000;      -- one-shot compress guard (default 500000000, upstream's limit; higher is unsupported)
+SET openzl_compression_level = 5;                -- default level (1-9, default 9) for any call that doesn't pass its own
+COPY big TO 'big.zl' (FORMAT OPENZL, ROW_GROUP_SIZE 50000);  -- passed through to parquet's writer
 ```
+
+`openzl_compression_level` is used by `openzl_compress`, `COPY ... FORMAT OPENZL`
+and `openzl_train` whenever the call doesn't give its own level (an explicit
+`COMPRESSION_LEVEL` / `compression_level` always wins). Higher is not
+necessarily smaller: on one synthetic table level 1 gave 51.9MB and level 9
+gave 57.4MB, so it's worth measuring on your data. `ROW_GROUP_SIZE` and
+`ROW_GROUP_SIZE_BYTES` are forwarded to the parquet writer, which sets how
+far a chunk can overshoot `CHUNK_SIZE_BYTES` and how much the writer buffers.
 
 Notes: chunk boundaries fall on parquet row-group boundaries, so a chunk can
 overshoot the target by up to a row group; each chunk is compressed

@@ -465,3 +465,71 @@ query IIII
 SELECT typeof(i), typeof(d), count(*), sum(m) FROM read_openzl('__TEST_DIR__/openzl_promoted.zl') GROUP BY 1, 2;
 ----
 BIGINT	DECIMAL(18,6)	3	6
+
+# ---- openzl_compression_level setting ----
+
+statement error
+SET openzl_compression_level = 0;
+----
+between 1 and 9
+
+statement error
+SET openzl_compression_level = 10;
+----
+between 1 and 9
+
+statement ok
+CREATE TABLE lvl AS SELECT range AS a, md5(range::VARCHAR) AS b FROM range(200000);
+
+statement ok
+COPY lvl TO '__TEST_DIR__/openzl_lvl_default.zl' (FORMAT OPENZL);
+
+statement ok
+SET openzl_compression_level = 1;
+
+statement ok
+COPY lvl TO '__TEST_DIR__/openzl_lvl_setting1.zl' (FORMAT OPENZL);
+
+# An explicit COMPRESSION_LEVEL wins over the setting.
+statement ok
+COPY lvl TO '__TEST_DIR__/openzl_lvl_explicit9.zl' (FORMAT OPENZL, COMPRESSION_LEVEL 9);
+
+statement ok
+RESET openzl_compression_level;
+
+statement ok
+COPY lvl TO '__TEST_DIR__/openzl_lvl_explicit1.zl' (FORMAT OPENZL, COMPRESSION_LEVEL 1);
+
+# The setting is the same knob as the option: setting=1 == explicit 1, and
+# explicit 9 == default (9), byte for byte.
+query II
+SELECT (SELECT content FROM read_blob('__TEST_DIR__/openzl_lvl_setting1.zl')) =
+       (SELECT content FROM read_blob('__TEST_DIR__/openzl_lvl_explicit1.zl')),
+       (SELECT content FROM read_blob('__TEST_DIR__/openzl_lvl_explicit9.zl')) =
+       (SELECT content FROM read_blob('__TEST_DIR__/openzl_lvl_default.zl'));
+----
+true	true
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_lvl_setting1.zl');
+----
+200000
+
+# ---- ROW_GROUP_SIZE passes through to parquet's writer ----
+
+statement ok
+COPY lvl TO '__TEST_DIR__/openzl_rg_small.zl' (FORMAT OPENZL, ROW_GROUP_SIZE 20000);
+
+statement ok
+COPY lvl TO '__TEST_DIR__/openzl_rg_default.zl' (FORMAT OPENZL);
+
+query II
+SELECT (SELECT count(DISTINCT row_group_id) FROM parquet_metadata('openzl://__TEST_DIR__/openzl_rg_small.zl')) >= 10,
+       (SELECT count(DISTINCT row_group_id) FROM parquet_metadata('openzl://__TEST_DIR__/openzl_rg_default.zl')) < 10;
+----
+true	true
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_rg_small.zl');
+----
+200000

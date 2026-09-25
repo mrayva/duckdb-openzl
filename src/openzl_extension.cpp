@@ -37,6 +37,17 @@ static size_t OpenzlMaxCompressBytes(ClientContext &context) {
 	return OpenzlSizeSetting(context, "openzl_max_compress_bytes", openzl_bridge::kDefaultMaxCompressBytes);
 }
 
+// openzl_compression_level (1-9, default 9): used wherever a call doesn't pass
+// an explicit level (openzl_compress's short forms, COPY without
+// COMPRESSION_LEVEL, openzl_train without compression_level).
+static int OpenzlDefaultCompressionLevel(ClientContext &context) {
+	Value v;
+	if (context.TryGetCurrentSetting("openzl_compression_level", v) && !v.IsNull()) {
+		return static_cast<int>(v.GetValue<int64_t>());
+	}
+	return 9;
+}
+
 static size_t OpenzlDefaultChunkBytes(ClientContext &context) {
 	return OpenzlSizeSetting(context, "openzl_chunk_size_bytes", openzl_bridge::kDefaultChunkBytes);
 }
@@ -73,7 +84,8 @@ inline void OpenzlCompressFun(DataChunk &args, ExpressionState &state, Vector &r
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
 	    input_vec, output_vec, result, args.size(), [&](string_t input_path, string_t output_path) {
 		    try {
-			    openzl_bridge::CompressParquet(input_path.GetString(), output_path.GetString(), string(), 9,
+			    openzl_bridge::CompressParquet(input_path.GetString(), output_path.GetString(), string(),
+			                                    OpenzlDefaultCompressionLevel(state.GetContext()),
 					                                OpenzlMaxCompressBytes(state.GetContext()));
 		    } catch (const openzl_bridge::Error &e) {
 			    throw IOException(e.what());
@@ -101,7 +113,7 @@ inline void OpenzlCompressWithOptionsFun(DataChunk &args, ExpressionState &state
 		auto output_path = args.data[1].GetValue(i).ToString();
 		auto trained_value = args.data[2].GetValue(i);
 		string trained_path = trained_value.IsNull() ? string() : trained_value.ToString();
-		int compression_level = 9;
+		int compression_level = OpenzlDefaultCompressionLevel(state.GetContext());
 		if (args.ColumnCount() > 3) {
 			auto level_value = args.data[3].GetValue(i);
 			if (!level_value.IsNull()) {
@@ -138,7 +150,7 @@ inline void OpenzlCompressWithBlobOptionsFun(DataChunk &args, ExpressionState &s
 			throw IOException("openzl_compress: trained_compressor_bytes must not be NULL");
 		}
 		string compressor_bytes = StringValue::Get(trained_value);
-		int compression_level = 9;
+		int compression_level = OpenzlDefaultCompressionLevel(state.GetContext());
 		if (args.ColumnCount() > 3) {
 			auto level_value = args.data[3].GetValue(i);
 			if (!level_value.IsNull()) {
@@ -277,7 +289,8 @@ static unique_ptr<FunctionData> OpenzlTrainBind(ClientContext &context, TableFun
 	opts.max_total_size_mb = static_cast<size_t>(GetNamedBigint(input, "max_total_size_mb", 0));
 	opts.pareto_frontier = GetNamedBool(input, "pareto_frontier", false);
 	opts.max_num_candidates = static_cast<size_t>(GetNamedBigint(input, "max_num_candidates", 0));
-	opts.compression_level = static_cast<int>(GetNamedBigint(input, "compression_level", 9));
+	opts.compression_level =
+	    static_cast<int>(GetNamedBigint(input, "compression_level", OpenzlDefaultCompressionLevel(context)));
 	opts.verbose = GetNamedBool(input, "verbose", false);
 	{
 		auto bench_it = input.named_parameters.find("benchmark");
@@ -558,7 +571,7 @@ struct OpenzlCopyBindData : public FunctionData {
 	unique_ptr<FunctionData> parquet_bind_data;
 	// '' = use the generic "parquet" graph (default).
 	string trained_compressor_path;
-	int compression_level = 9;
+	int compression_level = 9; // set from openzl_compression_level at bind time
 	// If true (the default), parquet's own writer stages into an in-memory
 	// buffer (OpenzlBufferFileSystem) instead of a real temp file on disk, so
 	// no intermediate file ever exists -- see OpenzlStartChunk/OpenzlEndChunk.
@@ -624,6 +637,14 @@ static unique_ptr<FunctionData> OpenzlCopyBind(ClientContext &context, CopyFunct
 	// -- there is no other valid way to write this format.
 	CopyInfo parquet_info;
 	parquet_info.format = "parquet";
+	// Row-group size shapes how large a chunk can overshoot its target and how
+	// much the parquet writer buffers; pass the user's choice straight through.
+	for (const char *opt : {"row_group_size", "row_group_size_bytes"}) {
+		auto rg_it = input.info.options.find(opt);
+		if (rg_it != input.info.options.end() && !rg_it->second.empty()) {
+			parquet_info.options[opt] = rg_it->second;
+		}
+	}
 	parquet_info.file_path = input.info.file_path;
 	parquet_info.options["compression"] = {Value("uncompressed")};
 	parquet_info.options["dictionary_size_limit"] = {Value::BIGINT(0)};
@@ -636,6 +657,7 @@ static unique_ptr<FunctionData> OpenzlCopyBind(ClientContext &context, CopyFunct
 	if (trained_it != input.info.options.end() && !trained_it->second.empty()) {
 		result->trained_compressor_path = trained_it->second[0].ToString();
 	}
+	result->compression_level = OpenzlDefaultCompressionLevel(context);
 	auto level_it = input.info.options.find("compression_level");
 	if (level_it != input.info.options.end() && !level_it->second.empty()) {
 		result->compression_level = level_it->second[0].GetValue<int32_t>();
@@ -863,6 +885,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Refuse to OpenZL-compress a single canonical-parquet input larger than this many bytes "
 	                          "(memory guard: compression peaks at ~4x the input in RAM). Default 500000000 (OpenZL's documented per-payload limit; raising it is unsupported upstream).",
 	                          LogicalType::UBIGINT, Value::UBIGINT(openzl_bridge::kDefaultMaxCompressBytes));
+	config.AddExtensionOption("openzl_compression_level",
+	                          "Default OpenZL compression level (1-9, default 9) for openzl_compress, COPY ... (FORMAT "
+	                          "OPENZL) and openzl_train when the call doesn't pass its own level.",
+	                          LogicalType::BIGINT, Value::BIGINT(9),
+	                          [](ClientContext &context, SetScope scope, Value &parameter) {
+		                          auto level = parameter.GetValue<int64_t>();
+		                          if (level < 1 || level > 9) {
+			                          throw InvalidInputException("openzl_compression_level must be between 1 and 9");
+		                          }
+	                          });
 	config.AddExtensionOption("openzl_chunk_size_bytes",
 	                          "COPY ... (FORMAT OPENZL) starts a new independent chunk once the staged parquet reaches "
 	                          "this many bytes, bounding peak memory regardless of table size; 0 disables chunking. "
