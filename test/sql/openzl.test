@@ -370,3 +370,44 @@ query I
 SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_empty.zl');
 ----
 0
+
+# ---- openzl_train benchmark columns ----
+
+# Not benchmarked by default without pareto_frontier: metric columns are NULL.
+query I
+SELECT compression_ratio IS NULL FROM openzl_train(
+    ['__TEST_DIR__/openzl_train_1.parquet', '__TEST_DIR__/openzl_train_2.parquet'],
+    NULL,
+    no_ace_successors := true
+);
+----
+true
+
+# benchmark := true reports ratio and both speeds for the single candidate.
+query III
+SELECT compression_ratio > 1, compress_mb_s > 0, decompress_mb_s > 0 FROM openzl_train(
+    ['__TEST_DIR__/openzl_train_1.parquet', '__TEST_DIR__/openzl_train_2.parquet'],
+    NULL,
+    no_ace_successors := true,
+    benchmark := true
+);
+----
+true	true	true
+
+# pareto_frontier benchmarks every candidate by default, on held-out files
+# when benchmark_files is given.
+query I
+SELECT count(*) > 0 AND bool_and(compression_ratio > 0 AND compress_mb_s > 0 AND decompress_mb_s > 0) FROM openzl_train(
+    ['__TEST_DIR__/openzl_train_1.parquet', '__TEST_DIR__/openzl_train_2.parquet'],
+    NULL,
+    no_ace_successors := true,
+    pareto_frontier := true,
+    benchmark_files := ['__TEST_DIR__/openzl_train_3.parquet']
+);
+----
+true
+
+statement error
+SELECT * FROM openzl_train(['__TEST_DIR__/openzl_train_1.parquet'], NULL, no_ace_successors := true, benchmark := true, benchmark_files := ['/nonexistent/held_out.parquet']);
+----
+benchmark file not found

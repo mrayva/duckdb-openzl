@@ -279,6 +279,19 @@ static unique_ptr<FunctionData> OpenzlTrainBind(ClientContext &context, TableFun
 	opts.max_num_candidates = static_cast<size_t>(GetNamedBigint(input, "max_num_candidates", 0));
 	opts.compression_level = static_cast<int>(GetNamedBigint(input, "compression_level", 9));
 	opts.verbose = GetNamedBool(input, "verbose", false);
+	{
+		auto bench_it = input.named_parameters.find("benchmark");
+		if (bench_it != input.named_parameters.end() && !bench_it->second.IsNull()) {
+			opts.benchmark_set = true;
+			opts.benchmark = bench_it->second.GetValue<bool>();
+		}
+		auto bench_files_it = input.named_parameters.find("benchmark_files");
+		if (bench_files_it != input.named_parameters.end() && !bench_files_it->second.IsNull()) {
+			for (auto &child : ListValue::GetChildren(bench_files_it->second)) {
+				opts.benchmark_paths.push_back(StringValue::Get(child));
+			}
+		}
+	}
 
 	auto result = make_uniq<OpenzlTrainBindData>();
 	try {
@@ -293,6 +306,14 @@ static unique_ptr<FunctionData> OpenzlTrainBind(ClientContext &context, TableFun
 	names.push_back("output_path");
 	return_types.push_back(LogicalType::BLOB);
 	names.push_back("compressor_bytes");
+	// NULL unless benchmarking ran (default on for pareto_frontier; see the
+	// benchmark / benchmark_files parameters).
+	return_types.push_back(LogicalType::DOUBLE);
+	names.push_back("compression_ratio");
+	return_types.push_back(LogicalType::DOUBLE);
+	names.push_back("compress_mb_s");
+	return_types.push_back(LogicalType::DOUBLE);
+	names.push_back("decompress_mb_s");
 	return std::move(result);
 }
 
@@ -318,6 +339,9 @@ static void OpenzlTrainFunction(ClientContext &context, TableFunctionInput &data
 		output.SetValue(0, count, Value::BIGINT(static_cast<int64_t>(gstate.offset)));
 		output.SetValue(1, count, out.path.empty() ? Value(LogicalType::VARCHAR) : Value(out.path));
 		output.SetValue(2, count, Value::BLOB_RAW(out.compressor_bytes));
+		output.SetValue(3, count, out.has_benchmark ? Value::DOUBLE(out.compression_ratio) : Value(LogicalType::DOUBLE));
+		output.SetValue(4, count, out.has_benchmark ? Value::DOUBLE(out.compress_mb_s) : Value(LogicalType::DOUBLE));
+		output.SetValue(5, count, out.has_benchmark ? Value::DOUBLE(out.decompress_mb_s) : Value(LogicalType::DOUBLE));
 		gstate.offset++;
 		count++;
 	}
@@ -340,6 +364,8 @@ static TableFunction GetOpenzlTrainFunction() {
 	function.named_parameters["max_num_candidates"] = LogicalType::BIGINT;
 	function.named_parameters["compression_level"] = LogicalType::BIGINT;
 	function.named_parameters["verbose"] = LogicalType::BOOLEAN;
+	function.named_parameters["benchmark"] = LogicalType::BOOLEAN;
+	function.named_parameters["benchmark_files"] = LogicalType::LIST(LogicalType::VARCHAR);
 	return function;
 }
 

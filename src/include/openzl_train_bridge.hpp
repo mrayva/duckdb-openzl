@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -82,6 +83,20 @@ struct TrainOptions {
 	// singleton, this also affects any other OpenZL logging in the same
 	// process for the duration of the call.
 	bool verbose = false;
+
+	// Benchmarks each returned candidate (compression ratio, compress and
+	// decompress MB/s -- the numbers `zli train --pareto-frontier` writes to
+	// benchmark.csv) so the caller can pick a point on the frontier. Costs one
+	// extra compress+decompress pass per candidate. Defaults to on for
+	// pareto_frontier, off otherwise (see TrainOptions handling in Train()).
+	// Set explicitly via `benchmark_set`.
+	bool benchmark = false;
+	bool benchmark_set = false;
+
+	// Files to benchmark the candidates on. Empty = the training samples
+	// themselves, which flatters the ratio (the compressor was fit to them);
+	// pass held-out canonical parquet files (same schema) for honest numbers.
+	std::vector<std::string> benchmark_paths;
 };
 
 // One trained candidate: the serialized compressor bytes (always populated),
@@ -91,6 +106,15 @@ struct TrainOptions {
 struct TrainedOutput {
 	std::string path;
 	std::string compressor_bytes;
+
+	// Filled only when benchmarking ran (has_benchmark). Measured over the
+	// benchmark files (or the training samples if none were given).
+	bool has_benchmark = false;
+	uint64_t original_bytes = 0;
+	uint64_t compressed_bytes = 0;
+	double compression_ratio = 0;
+	double compress_mb_s = 0;
+	double decompress_mb_s = 0;
 };
 
 // Trains a compressor against `sample_paths` (canonical parquet files sharing

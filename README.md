@@ -188,7 +188,14 @@ path); everything else is an optional named parameter mirroring OpenZL's own
 | `pareto_frontier` | BOOLEAN | `false` | Returns a ratio/speed trade-off curve (one row + one output file per point) instead of a single best candidate. |
 | `max_num_candidates` | BIGINT | no cap | Caps candidates kept per trainer before combining results. |
 | `compression_level` | BIGINT | 9 | Applied to the base graph before training explores variations of it. |
+| `benchmark` | BOOLEAN | `true` with `pareto_frontier`, else `false` | Measures each returned candidate and fills the `compression_ratio`, `compress_mb_s` and `decompress_mb_s` columns (NULL otherwise) -- the same numbers `zli train --pareto-frontier` writes to `benchmark.csv`. Costs one extra compress+decompress pass per candidate. |
+| `benchmark_files` | VARCHAR[] | the training samples | Canonical parquet files to benchmark on. The default flatters the ratio because the compressor was fit to those samples; pass held-out files for honest numbers. |
 | `verbose` | BOOLEAN | `false` | OpenZL's training internals print CLI-style progress bars via a process-global logger; off by default since this runs from SQL, not a terminal. |
+
+Choosing from a Pareto frontier: run with `pareto_frontier := true` and
+`benchmark_files := [<held-out files>]`, then `ORDER BY` / `WHERE` on the metric
+columns and use the `candidate_index` (or its `compressor_bytes`) that fits,
+e.g. `SELECT candidate_index FROM openzl_train(...) WHERE decompress_mb_s > 500 ORDER BY compression_ratio DESC LIMIT 1`.
 
 A trained compressor is tied to the schema it was trained on (same columns,
 same types) -- compressing differently-shaped data with it throws an OpenZL

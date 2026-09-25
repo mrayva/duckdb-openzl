@@ -12,6 +12,7 @@
 #include "tools/logger/Logger.h"
 #include "tools/training/train.h"
 #include "tools/training/train_params.h"
+#include "tools/training/utils/benchmark.h"
 #include "tools/training/utils/utils.h"
 
 #include "openzl_internal_io.hpp"
@@ -150,6 +151,46 @@ std::vector<TrainedOutput> Train(const std::vector<std::string> &sample_paths, c
 			throw Error("openzl_bridge: training produced no candidates");
 		}
 
+		// Optional per-candidate benchmark (ratio + speeds). Held-out files if
+		// given, else the training samples themselves.
+		const bool do_benchmark = opts.benchmark_set ? opts.benchmark : opts.pareto_frontier;
+		std::vector<std::string> bench_buffers;
+		std::vector<openzl::training::MultiInput> bench_inputs;
+		if (do_benchmark && !opts.benchmark_paths.empty()) {
+			for (const auto &path : opts.benchmark_paths) {
+				if (!FileExists(path)) {
+					throw Error("openzl_bridge: benchmark file not found: " + path);
+				}
+				bench_buffers.push_back(ReadFile(path));
+			}
+			for (const auto &buf : bench_buffers) {
+				openzl::training::MultiInput mi;
+				mi.add(openzl::Input::refSerial(buf));
+				bench_inputs.push_back(std::move(mi));
+			}
+		}
+		const auto &bench_set = bench_inputs.empty() ? inputs : bench_inputs;
+		auto benchmark_candidate = [&](openzl::training::TrainedCandidate &cand, TrainedOutput &out) {
+			if (!do_benchmark) {
+				return;
+			}
+			std::string fat_bundle;
+			if (!cand.dicts.empty()) {
+				fat_bundle = cand.packFatBundle();
+			}
+			auto comp = params.compressorGenFunc(cand.serializedCompressor, fat_bundle);
+			auto res = openzl::training::benchmark(*comp, bench_set, fat_bundle);
+			if (!res) {
+				throw Error("openzl_bridge: benchmarking a trained candidate failed");
+			}
+			out.has_benchmark = true;
+			out.original_bytes = res->originalSize;
+			out.compressed_bytes = res->compressedSize;
+			out.compression_ratio = res->compressionRatio();
+			out.compress_mb_s = res->compressionSpeedMBps();
+			out.decompress_mb_s = res->decompressionSpeedMBps();
+		};
+
 		std::vector<TrainedOutput> outputs;
 		if (!opts.pareto_frontier) {
 			if (candidates.size() != 1) {
@@ -157,6 +198,7 @@ std::vector<TrainedOutput> Train(const std::vector<std::string> &sample_paths, c
 				            " candidates, expected 1");
 			}
 			TrainedOutput out;
+			benchmark_candidate(candidates[0], out);
 			out.compressor_bytes = std::move(candidates[0].serializedCompressor);
 			if (!output_path.empty()) {
 				WriteFile(output_path, out.compressor_bytes);
@@ -166,6 +208,7 @@ std::vector<TrainedOutput> Train(const std::vector<std::string> &sample_paths, c
 		} else {
 			for (size_t i = 0; i < candidates.size(); ++i) {
 				TrainedOutput out;
+				benchmark_candidate(candidates[i], out);
 				out.compressor_bytes = std::move(candidates[i].serializedCompressor);
 				if (!output_path.empty()) {
 					std::string path = NumberedPath(output_path, i);
