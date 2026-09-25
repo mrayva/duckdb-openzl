@@ -533,3 +533,129 @@ query I
 SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_rg_small.zl');
 ----
 200000
+
+# ---- FORMAT_VERSION / PROFILE / PARQUET_CHUNK_SIZE_BYTES ----
+
+statement error
+SET openzl_profile = 'bogus';
+COPY lvl TO '__TEST_DIR__/x_bad_profile.zl' (FORMAT OPENZL);
+----
+unknown profile
+
+statement ok
+RESET openzl_profile;
+
+statement error
+COPY lvl TO '__TEST_DIR__/x_bad_version.zl' (FORMAT OPENZL, FORMAT_VERSION 3);
+----
+outside the supported range
+
+# Internal chunking needs format version >= 21.
+statement error
+COPY lvl TO '__TEST_DIR__/x_chunk_old.zl' (FORMAT OPENZL, FORMAT_VERSION 20, PARQUET_CHUNK_SIZE_BYTES 1000000);
+----
+needs format version >= 21
+
+statement error
+COPY lvl TO '__TEST_DIR__/x_neg.zl' (FORMAT OPENZL, PARQUET_CHUNK_SIZE_BYTES -1);
+----
+must be >= 0
+
+# A trained compressor is parquet-profile only.
+statement error
+COPY lvl TO '__TEST_DIR__/x_trained_serial.zl' (FORMAT OPENZL, PROFILE 'serial', TRAINED_COMPRESSOR '__TEST_DIR__/openzl_trained.compressor');
+----
+can't be combined with PROFILE
+
+# Every combination round-trips.
+statement ok
+COPY lvl TO '__TEST_DIR__/openzl_v21.zl' (FORMAT OPENZL, FORMAT_VERSION 21);
+
+statement ok
+COPY lvl TO '__TEST_DIR__/openzl_pchunk.zl' (FORMAT OPENZL, PARQUET_CHUNK_SIZE_BYTES 1000000);
+
+statement ok
+COPY lvl TO '__TEST_DIR__/openzl_serial.zl' (FORMAT OPENZL, PROFILE 'serial');
+
+query III
+SELECT (SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_v21.zl')),
+       (SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_pchunk.zl')),
+       (SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_serial.zl'));
+----
+200000	200000	200000
+
+query I
+SELECT (SELECT sum(a) FROM read_openzl('__TEST_DIR__/openzl_pchunk.zl')) = (SELECT sum(a) FROM lvl);
+----
+true
+
+# The graphs really differ: the serial profile's bytes are not the parquet
+# profile's.
+query I
+SELECT (SELECT content FROM read_blob('__TEST_DIR__/openzl_serial.zl')) !=
+       (SELECT content FROM read_blob('__TEST_DIR__/openzl_lvl_default.zl'));
+----
+true
+
+# Settings are the defaults for COPY and openzl_compress; an option overrides.
+statement ok
+SET openzl_profile = 'serial';
+
+statement ok
+COPY lvl TO '__TEST_DIR__/openzl_serial_setting.zl' (FORMAT OPENZL);
+
+statement ok
+COPY lvl TO '__TEST_DIR__/openzl_parquet_override.zl' (FORMAT OPENZL, PROFILE 'parquet');
+
+statement ok
+RESET openzl_profile;
+
+query II
+SELECT (SELECT content FROM read_blob('__TEST_DIR__/openzl_serial_setting.zl')) =
+       (SELECT content FROM read_blob('__TEST_DIR__/openzl_serial.zl')),
+       (SELECT content FROM read_blob('__TEST_DIR__/openzl_parquet_override.zl')) =
+       (SELECT content FROM read_blob('__TEST_DIR__/openzl_lvl_default.zl'));
+----
+true	true
+
+statement ok
+SET openzl_parquet_chunk_bytes = 1000000;
+
+statement ok
+SELECT openzl_compress('__TEST_DIR__/openzl_roundtrip.parquet', '__TEST_DIR__/openzl_scalar_chunked.zl');
+
+statement ok
+RESET openzl_parquet_chunk_bytes;
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_scalar_chunked.zl');
+----
+1000
+
+# openzl_train takes the same knobs (baked into the trained compressor).
+query I
+SELECT count(*) FROM openzl_train(['__TEST_DIR__/openzl_train_1.parquet'], NULL, no_ace_successors := true,
+                                  format_version := 21, parquet_chunk_bytes := 100000);
+----
+1
+
+statement error
+SELECT * FROM openzl_train(['__TEST_DIR__/openzl_train_1.parquet'], NULL, format_version := 20, parquet_chunk_bytes := 100000);
+----
+needs format version >= 21
+
+# A version too old for the graph gets a clear message (not "is it canonical parquet?").
+statement error
+COPY lvl TO '__TEST_DIR__/x_v8.zl' (FORMAT OPENZL, FORMAT_VERSION 8);
+----
+too old for this data
+
+# What a given version supports depends on the codecs the graph picks for the
+# data: a small table of plain integers/short strings still works at v10.
+statement ok
+COPY t TO '__TEST_DIR__/openzl_v10.zl' (FORMAT OPENZL, FORMAT_VERSION 10);
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_v10.zl');
+----
+1000

@@ -84,6 +84,13 @@ struct TrainOptions {
 	// process for the duration of the call.
 	bool verbose = false;
 
+	// Frame format version and parquet internal chunk size baked into the
+	// trained compressor (see GraphOptions in openzl_bridge.hpp; the parquet
+	// profile is the only one that can be trained here). 0 = newest / no
+	// internal chunking.
+	int format_version = 0;
+	size_t parquet_chunk_bytes = 0;
+
 	// Benchmarks each returned candidate (compression ratio, compress and
 	// decompress MB/s -- the numbers `zli train --pareto-frontier` writes to
 	// benchmark.csv) so the caller can pick a point on the frontier. Costs one

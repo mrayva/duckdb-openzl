@@ -110,11 +110,16 @@ std::vector<TrainedOutput> Train(const std::vector<std::string> &sample_paths, c
 			inputs.push_back(std::move(mi));
 		}
 
-		openzl::Compressor compressor = BuildParquetCompressor();
+		GraphOptions graph_opts;
+		graph_opts.format_version = opts.format_version;
+		graph_opts.parquet_chunk_bytes = opts.parquet_chunk_bytes;
+		ValidateGraphOptions(graph_opts);
+		openzl::Compressor compressor = BuildParquetCompressor(opts.parquet_chunk_bytes);
 		// Same requirement as CompressParquet(): required when driving the C++
 		// API directly, or training fails with "Compressor format version is
 		// not set" the first time it tries to compress a candidate.
-		compressor.setParameter(openzl::CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+		compressor.setParameter(openzl::CParam::FormatVersion,
+		                        opts.format_version == 0 ? ZL_MAX_FORMAT_VERSION : opts.format_version);
 		compressor.setParameter(openzl::CParam::CompressionLevel, opts.compression_level);
 
 		openzl::training::TrainParams params;

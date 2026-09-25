@@ -395,6 +395,45 @@ Two build gotchas worth knowing if you touch this again:
   500MB (raising it is opt-in), and chunking (next section) keeps every
   compress call inside it for tables of any size.
 
+## Graph and format options
+
+Three knobs shape which OpenZL graph compresses the parquet bytes and how the
+frame is written. Each is a `SET` default plus a per-COPY option; the scalar
+`openzl_compress` follows the settings, and `openzl_train` takes
+`format_version` / `parquet_chunk_bytes` as named parameters.
+
+| `SET` (default) | COPY option | Meaning |
+|---|---|---|
+| `openzl_format_version` (0 = newest, 27) | `FORMAT_VERSION` | Frame format version to write (8-27). Pin it so an older OpenZL can read the archive. Decompression needs no setting. |
+| `openzl_profile` (`'parquet'`) | `PROFILE` | `parquet`: the parquet-aware graph (canonical parquet only). `serial`: generic byte compression, a baseline for what the parquet graph buys. A trained compressor is parquet-only. |
+| `openzl_parquet_chunk_bytes` (0) | `PARQUET_CHUNK_SIZE_BYTES` | Split the input into independently compressed chunks of about this size *inside* each frame. 0 = one chunk. Needs format version >= 21. |
+
+```sql
+COPY tbl TO 'a.zl' (FORMAT OPENZL, FORMAT_VERSION 21);           -- readable by older OpenZL builds
+COPY tbl TO 'b.zl' (FORMAT OPENZL, PARQUET_CHUNK_SIZE_BYTES 20000000);
+COPY tbl TO 'c.zl' (FORMAT OPENZL, PROFILE 'serial');            -- no parquet awareness
+```
+
+Measured on Hacker News data (canonical parquet, single call):
+
+| Input | Setting | Size | Peak RSS |
+|---|---|---|---|
+| 163MB | no internal chunking (default) | 48.74MB | 747MB |
+| 163MB | `PARQUET_CHUNK_SIZE_BYTES 20000000` | 49.01MB (+0.6%) | 434MB |
+| 163MB | `PROFILE 'serial'` | 53.35MB (+9.5%) | 388MB |
+| 1.06GB | no internal chunking | 310.0MB | 4.45GB |
+| 1.06GB | `PARQUET_CHUNK_SIZE_BYTES 20000000` | 312.97MB (+1.0%) | 2.20GB |
+
+Internal chunking roughly halves compress memory for about 1% of ratio; upstream's own `zli --profile parquet`
+uses 20MB chunks, but this extension defaults to none to keep existing archives and results unchanged. It's
+separate from `openzl_chunk_size_bytes` above, which splits a *table* into independent parquet files; this
+splits one parquet file's data inside a single frame. A trained compressor carries the chunk size it was
+trained with (pass `parquet_chunk_bytes` to `openzl_train`).
+
+What a format version supports depends on the codecs the graph picks for your data: a small table works down to
+version 10, while the serial profile needs roughly 24+. Too old a version fails with an error that says so, not
+with corrupt output.
+
 ## Typed columns from text: `openzl_promote`
 
 A raw mirror often keeps every CSV column as VARCHAR (DuckDB's type sniffing

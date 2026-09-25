@@ -48,6 +48,24 @@ static int OpenzlDefaultCompressionLevel(ClientContext &context) {
 	return 9;
 }
 
+// openzl_format_version / openzl_profile / openzl_parquet_chunk_bytes: the
+// graph-shaping defaults, overridable per COPY (FORMAT_VERSION, PROFILE,
+// PARQUET_CHUNK_SIZE_BYTES). See GraphOptions in openzl_bridge.hpp.
+static openzl_bridge::GraphOptions OpenzlDefaultGraphOptions(ClientContext &context) {
+	openzl_bridge::GraphOptions g;
+	Value v;
+	if (context.TryGetCurrentSetting("openzl_format_version", v) && !v.IsNull()) {
+		g.format_version = static_cast<int>(v.GetValue<int64_t>());
+	}
+	if (context.TryGetCurrentSetting("openzl_profile", v) && !v.IsNull()) {
+		g.profile = v.ToString();
+	}
+	if (context.TryGetCurrentSetting("openzl_parquet_chunk_bytes", v) && !v.IsNull()) {
+		g.parquet_chunk_bytes = static_cast<size_t>(v.GetValue<uint64_t>());
+	}
+	return g;
+}
+
 static size_t OpenzlDefaultChunkBytes(ClientContext &context) {
 	return OpenzlSizeSetting(context, "openzl_chunk_size_bytes", openzl_bridge::kDefaultChunkBytes);
 }
@@ -86,7 +104,8 @@ inline void OpenzlCompressFun(DataChunk &args, ExpressionState &state, Vector &r
 		    try {
 			    openzl_bridge::CompressParquet(input_path.GetString(), output_path.GetString(), string(),
 			                                    OpenzlDefaultCompressionLevel(state.GetContext()),
-					                                OpenzlMaxCompressBytes(state.GetContext()));
+					                                OpenzlMaxCompressBytes(state.GetContext()),
+			                                OpenzlDefaultGraphOptions(state.GetContext()));
 		    } catch (const openzl_bridge::Error &e) {
 			    throw IOException(e.what());
 		    }
@@ -122,7 +141,8 @@ inline void OpenzlCompressWithOptionsFun(DataChunk &args, ExpressionState &state
 		}
 		try {
 			openzl_bridge::CompressParquet(input_path, output_path, trained_path, compression_level,
-			                                OpenzlMaxCompressBytes(state.GetContext()));
+			                                OpenzlMaxCompressBytes(state.GetContext()),
+			                                OpenzlDefaultGraphOptions(state.GetContext()));
 		} catch (const openzl_bridge::Error &e) {
 			throw IOException(e.what());
 		}
@@ -160,7 +180,8 @@ inline void OpenzlCompressWithBlobOptionsFun(DataChunk &args, ExpressionState &s
 		try {
 			openzl_bridge::CompressParquetWithCompressorBytes(input_path, output_path, compressor_bytes,
 			                                                   compression_level,
-			                                                   OpenzlMaxCompressBytes(state.GetContext()));
+			                                                   OpenzlMaxCompressBytes(state.GetContext()),
+			                                OpenzlDefaultGraphOptions(state.GetContext()));
 		} catch (const openzl_bridge::Error &e) {
 			throw IOException(e.what());
 		}
@@ -293,6 +314,12 @@ static unique_ptr<FunctionData> OpenzlTrainBind(ClientContext &context, TableFun
 	    static_cast<int>(GetNamedBigint(input, "compression_level", OpenzlDefaultCompressionLevel(context)));
 	opts.verbose = GetNamedBool(input, "verbose", false);
 	{
+		auto g = OpenzlDefaultGraphOptions(context);
+		opts.format_version = static_cast<int>(GetNamedBigint(input, "format_version", g.format_version));
+		opts.parquet_chunk_bytes = static_cast<size_t>(
+		    GetNamedBigint(input, "parquet_chunk_bytes", static_cast<int64_t>(g.parquet_chunk_bytes)));
+	}
+	{
 		auto bench_it = input.named_parameters.find("benchmark");
 		if (bench_it != input.named_parameters.end() && !bench_it->second.IsNull()) {
 			opts.benchmark_set = true;
@@ -377,6 +404,8 @@ static TableFunction GetOpenzlTrainFunction() {
 	function.named_parameters["max_num_candidates"] = LogicalType::BIGINT;
 	function.named_parameters["compression_level"] = LogicalType::BIGINT;
 	function.named_parameters["verbose"] = LogicalType::BOOLEAN;
+	function.named_parameters["format_version"] = LogicalType::BIGINT;
+	function.named_parameters["parquet_chunk_bytes"] = LogicalType::BIGINT;
 	function.named_parameters["benchmark"] = LogicalType::BOOLEAN;
 	function.named_parameters["benchmark_files"] = LogicalType::LIST(LogicalType::VARCHAR);
 	return function;
@@ -585,6 +614,7 @@ struct OpenzlCopyBindData : public FunctionData {
 	// overrides it per COPY.
 	size_t chunk_size_bytes = 0;
 	size_t max_compress_bytes = openzl_bridge::kDefaultMaxCompressBytes;
+	openzl_bridge::GraphOptions graph;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<OpenzlCopyBindData>();
@@ -595,6 +625,7 @@ struct OpenzlCopyBindData : public FunctionData {
 		result->in_memory = in_memory;
 		result->chunk_size_bytes = chunk_size_bytes;
 		result->max_compress_bytes = max_compress_bytes;
+		result->graph = graph;
 		return std::move(result);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -602,7 +633,9 @@ struct OpenzlCopyBindData : public FunctionData {
 		return parquet_bind_data->Equals(*other.parquet_bind_data) &&
 		       trained_compressor_path == other.trained_compressor_path &&
 		       compression_level == other.compression_level && in_memory == other.in_memory &&
-		       chunk_size_bytes == other.chunk_size_bytes && max_compress_bytes == other.max_compress_bytes;
+		       chunk_size_bytes == other.chunk_size_bytes && max_compress_bytes == other.max_compress_bytes &&
+		       graph.format_version == other.graph.format_version && graph.profile == other.graph.profile &&
+		       graph.parquet_chunk_bytes == other.graph.parquet_chunk_bytes;
 	}
 };
 
@@ -676,6 +709,33 @@ static unique_ptr<FunctionData> OpenzlCopyBind(ClientContext &context, CopyFunct
 		result->chunk_size_bytes = static_cast<size_t>(v);
 	}
 	result->max_compress_bytes = OpenzlMaxCompressBytes(context);
+	result->graph = OpenzlDefaultGraphOptions(context);
+	auto fv_it = input.info.options.find("format_version");
+	if (fv_it != input.info.options.end() && !fv_it->second.empty()) {
+		result->graph.format_version = fv_it->second[0].GetValue<int32_t>();
+	}
+	auto profile_it = input.info.options.find("profile");
+	if (profile_it != input.info.options.end() && !profile_it->second.empty()) {
+		result->graph.profile = profile_it->second[0].ToString();
+	}
+	auto pchunk_it = input.info.options.find("parquet_chunk_size_bytes");
+	if (pchunk_it != input.info.options.end() && !pchunk_it->second.empty()) {
+		auto v = pchunk_it->second[0].GetValue<int64_t>();
+		if (v < 0) {
+			throw BinderException("PARQUET_CHUNK_SIZE_BYTES must be >= 0 (0 = no internal chunking)");
+		}
+		result->graph.parquet_chunk_bytes = static_cast<size_t>(v);
+	}
+	try {
+		openzl_bridge::ValidateGraphOptions(result->graph);
+	} catch (const openzl_bridge::Error &e) {
+		throw BinderException(e.what());
+	}
+	if (!result->trained_compressor_path.empty() && result->graph.profile != "parquet") {
+		throw BinderException("COPY ... FORMAT OPENZL: TRAINED_COMPRESSOR is built on the parquet profile and can't "
+		                      "be combined with PROFILE '%s'",
+		                      result->graph.profile);
+	}
 	return std::move(result);
 }
 
@@ -711,7 +771,7 @@ static void OpenzlEndChunk(ClientContext &context, OpenzlCopyBindData &bind_data
 			std::string canonical_bytes = OpenzlBufferFileSystem::TakeBuffer(gstate.tmp_parquet_path);
 			frame = openzl_bridge::CompressParquetBytesToString(canonical_bytes, bind_data.trained_compressor_path,
 			                                                     bind_data.compression_level,
-			                                                     bind_data.max_compress_bytes);
+			                                                     bind_data.max_compress_bytes, bind_data.graph);
 		} else {
 			// Read the staged file, refusing an oversized one before allocating.
 			std::string canonical_bytes;
@@ -734,7 +794,7 @@ static void OpenzlEndChunk(ClientContext &context, OpenzlCopyBindData &bind_data
 			}
 			frame = openzl_bridge::CompressParquetBytesToString(canonical_bytes, bind_data.trained_compressor_path,
 			                                                     bind_data.compression_level,
-			                                                     bind_data.max_compress_bytes);
+			                                                     bind_data.max_compress_bytes, bind_data.graph);
 		}
 	} catch (const openzl_bridge::Error &e) {
 		if (!bind_data.in_memory) {
@@ -895,6 +955,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 			                          throw InvalidInputException("openzl_compression_level must be between 1 and 9");
 		                          }
 	                          });
+	config.AddExtensionOption("openzl_format_version",
+	                          "OpenZL frame format version to write (8..27); 0 (default) = the newest this build "
+	                          "supports. Pin it to make archives readable by an older OpenZL.",
+	                          LogicalType::BIGINT, Value::BIGINT(0));
+	config.AddExtensionOption("openzl_profile",
+	                          "Compression graph: 'parquet' (default, parquet-aware, canonical parquet only) or "
+	                          "'serial' (generic bytes, a baseline for what the parquet graph buys).",
+	                          LogicalType::VARCHAR, Value("parquet"));
+	config.AddExtensionOption("openzl_parquet_chunk_bytes",
+	                          "Parquet profile: split the input into independently compressed chunks of about this "
+	                          "many bytes inside each frame (0 = no internal chunking). Needs format version >= 21.",
+	                          LogicalType::UBIGINT, Value::UBIGINT(0));
 	config.AddExtensionOption("openzl_chunk_size_bytes",
 	                          "COPY ... (FORMAT OPENZL) starts a new independent chunk once the staged parquet reaches "
 	                          "this many bytes, bounding peak memory regardless of table size; 0 disables chunking. "

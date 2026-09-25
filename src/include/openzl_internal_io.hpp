@@ -11,6 +11,9 @@
 
 #include "openzl/cpp/Compressor.hpp"
 
+#include "openzl/codecs/zl_ace.h"
+#include "openzl/codecs/zl_lz.h"
+#include "openzl/codecs/zl_segmenters.h"
 #include "custom_parsers/parquet/parquet_graph.h"
 #include "custom_parsers/shared_components/clustering.h"
 
@@ -58,12 +61,37 @@ inline void WriteFile(const std::string &path, const std::string &contents) {
 // parquet-aware graph, matching what `zli --profile parquet` builds
 // internally (see facebook/openzl cli/utils/compress_profiles.cpp). This is
 // also the base graph Train() starts its search from.
-inline openzl::Compressor BuildParquetCompressor() {
+//
+// `chunk_bytes` > 0 makes the parquet graph split its input into independently
+// compressed chunks of about that size inside the frame (upstream's own
+// `zli --profile parquet` uses 20MB); 0 (the historical default here) compresses
+// the whole input as one chunk. Chunking needs frame format version >= 21.
+inline openzl::Compressor BuildParquetCompressor(size_t chunk_bytes = 0) {
 	openzl::Compressor compressor;
 	ZL_Compressor *comp = compressor.get();
 	ZL_GraphID clustering = ZS2_createGraph_genericClustering(comp);
-	ZL_GraphID parquet_graph = ZL_Parquet_registerGraph(comp, clustering);
+	ZL_GraphID parquet_graph = ZL_Parquet_registerGraph_withChunkSize(comp, clustering, static_cast<int>(chunk_bytes));
 	compressor.selectStartingGraph(parquet_graph);
+	return compressor;
+}
+
+// The "serial" profile: parquet bytes treated as opaque data (an LZ-backed
+// ACE graph under a serial segmenter), like `zli --profile serial`. No parquet
+// awareness, so it also accepts non-canonical input; useful as a baseline for
+// what the parquet graph buys. `chunk_bytes` 0 = OpenZL's default segment size.
+inline openzl::Compressor BuildSerialCompressor(size_t chunk_bytes = 0) {
+	openzl::Compressor compressor;
+	ZL_Compressor *comp = compressor.get();
+	ZL_GraphID inner = ZL_Compressor_buildACEGraphWithDefault(comp, ZL_GRAPH_LZ);
+	if (!ZL_GraphID_isValid(inner)) {
+		throw Error("openzl_bridge: could not build the serial profile's inner graph");
+	}
+	ZL_GraphID graph = ZL_Compressor_buildSerialSegmenter(
+	    comp, chunk_bytes > 0 ? chunk_bytes : ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE, inner);
+	if (!ZL_GraphID_isValid(graph)) {
+		throw Error("openzl_bridge: could not build the serial profile graph");
+	}
+	compressor.selectStartingGraph(graph);
 	return compressor;
 }
 
