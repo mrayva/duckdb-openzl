@@ -369,6 +369,178 @@ static TableFunction GetOpenzlTrainFunction() {
 	return function;
 }
 
+
+// openzl_promote(table[, max_int_digits := 18, decimal_int_digits := 12,
+//                 decimal_scale := 6, promote_decimal := true]) -> table
+//
+// Streams `table` with its all-VARCHAR columns promoted to numeric types --
+// but only where that is lossless. A raw mirror often stores every column as
+// VARCHAR (DuckDB's CSV type sniffing silently drops non-conforming rows under
+// ignore_errors=true, so loading as text is the safe default), and numbers as
+// text compress noticeably worse than typed columns. This runs one analysis
+// pass at bind time, then reads the table again with the casts applied:
+//
+//   COPY (SELECT * FROM openzl_promote('tbl')) TO 'tbl.zl' (FORMAT OPENZL);
+//
+// A VARCHAR column becomes BIGINT if EVERY non-null value is an exact integer
+// (`0` or `-?[1-9]` followed by at most max_int_digits-1 digits: no leading
+// zeros, no '+', no spaces), else DECIMAL(decimal_int_digits + decimal_scale,
+// decimal_scale) if every non-null value is a plain decimal that fits (only
+// formatting can differ, e.g. 9.30 -> 9.3, .5 -> 0.5). Anything else, all-NULL
+// columns and non-VARCHAR columns pass through unchanged. `table` is the name
+// of a table or view, optionally qualified/quoted ("schema"."name").
+//
+// The table is read through a second connection, so it sees committed data
+// only. The scan is single-threaded (a nested streaming query).
+struct OpenzlPromoteBindData : public TableFunctionData {
+	string select_sql;
+	vector<string> promoted; // "column:TYPE" for each promoted column (informational)
+};
+
+static string OpenzlPromoteIdent(const string &name) {
+	return KeywordHelper::WriteQuoted(name, '"');
+}
+
+static unique_ptr<FunctionData> OpenzlPromoteBind(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	if (input.inputs[0].IsNull()) {
+		throw BinderException("openzl_promote: table name must not be NULL");
+	}
+	string table = StringValue::Get(input.inputs[0]);
+	if (table.empty() || table.find(';') != string::npos) {
+		throw BinderException("openzl_promote: expected a table or view name, got '%s'", table);
+	}
+	int64_t max_int_digits = GetNamedBigint(input, "max_int_digits", 18);
+	int64_t dec_int_digits = GetNamedBigint(input, "decimal_int_digits", 12);
+	int64_t dec_scale = GetNamedBigint(input, "decimal_scale", 6);
+	bool promote_decimal = GetNamedBool(input, "promote_decimal", true);
+	if (max_int_digits < 1 || max_int_digits > 18) {
+		throw BinderException("openzl_promote: max_int_digits must be between 1 and 18");
+	}
+	if (dec_scale < 1 || dec_int_digits < 1 || dec_int_digits + dec_scale > 18) {
+		throw BinderException("openzl_promote: decimal_scale and decimal_int_digits must be >= 1 and sum to at most 18");
+	}
+
+	Connection con(DatabaseInstance::GetDatabase(context));
+	auto desc = con.Query("DESCRIBE SELECT * FROM " + table);
+	if (desc->HasError()) {
+		throw BinderException("openzl_promote: cannot read '%s': %s", table, desc->GetError());
+	}
+	vector<string> col_names;
+	vector<bool> is_varchar;
+	for (idx_t i = 0; i < desc->RowCount(); i++) {
+		col_names.push_back(desc->GetValue(0, i).ToString());
+		is_varchar.push_back(desc->GetValue(1, i).ToString() == "VARCHAR");
+	}
+
+	string int_re = "(0|-?[1-9][0-9]{0," + std::to_string(max_int_digits - 1) + "})";
+	string frac = "[0-9]{1," + std::to_string(dec_scale) + "}";
+	string dec_re = "-?((0|[1-9][0-9]{0," + std::to_string(dec_int_digits - 1) + "})(\\." + frac + ")?|\\." + frac + ")";
+	string dec_type = "DECIMAL(" + std::to_string(dec_int_digits + dec_scale) + "," + std::to_string(dec_scale) + ")";
+
+	string aggs;
+	vector<idx_t> agg_col; // column index for each aggregate triple
+	for (idx_t i = 0; i < col_names.size(); i++) {
+		if (!is_varchar[i]) {
+			continue;
+		}
+		string c = OpenzlPromoteIdent(col_names[i]);
+		if (!aggs.empty()) {
+			aggs += ", ";
+		}
+		aggs += "count(" + c + "), bool_and(" + c + " IS NULL OR regexp_full_match(" + c + ", '" + int_re + "')), " +
+		        "bool_and(" + c + " IS NULL OR regexp_full_match(" + c + ", '" + dec_re + "'))";
+		agg_col.push_back(i);
+	}
+
+	vector<string> verdict(col_names.size());
+	auto result = make_uniq<OpenzlPromoteBindData>();
+	if (!aggs.empty()) {
+		auto stats = con.Query("SELECT " + aggs + " FROM " + table);
+		if (stats->HasError()) {
+			throw IOException("openzl_promote: analysis of '%s' failed: %s", table, stats->GetError());
+		}
+		for (idx_t k = 0; k < agg_col.size(); k++) {
+			idx_t i = agg_col[k];
+			auto nonnull = stats->GetValue(3 * k, 0);
+			if (nonnull.IsNull() || nonnull.GetValue<int64_t>() == 0) {
+				continue;
+			}
+			auto all_int = stats->GetValue(3 * k + 1, 0);
+			auto all_dec = stats->GetValue(3 * k + 2, 0);
+			if (!all_int.IsNull() && all_int.GetValue<bool>()) {
+				verdict[i] = "BIGINT";
+			} else if (promote_decimal && !all_dec.IsNull() && all_dec.GetValue<bool>()) {
+				verdict[i] = dec_type;
+			}
+			if (!verdict[i].empty()) {
+				result->promoted.push_back(col_names[i] + ":" + verdict[i]);
+			}
+		}
+	}
+
+	string select_list;
+	for (idx_t i = 0; i < col_names.size(); i++) {
+		string c = OpenzlPromoteIdent(col_names[i]);
+		if (i > 0) {
+			select_list += ", ";
+		}
+		select_list += verdict[i].empty() ? c : "CAST(" + c + " AS " + verdict[i] + ") AS " + c;
+	}
+	result->select_sql = "SELECT " + select_list + " FROM " + table;
+
+	auto schema = con.Query(result->select_sql + " LIMIT 0");
+	if (schema->HasError()) {
+		throw IOException("openzl_promote: %s", schema->GetError());
+	}
+	return_types = schema->types;
+	names = schema->names;
+	return std::move(result);
+}
+
+struct OpenzlPromoteGlobalState : public GlobalTableFunctionState {
+	unique_ptr<Connection> con;
+	unique_ptr<QueryResult> result;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<GlobalTableFunctionState> OpenzlPromoteInitGlobal(ClientContext &context,
+                                                                     TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<OpenzlPromoteBindData>();
+	auto state = make_uniq<OpenzlPromoteGlobalState>();
+	state->con = make_uniq<Connection>(DatabaseInstance::GetDatabase(context));
+	state->result = state->con->SendQuery(bind_data.select_sql);
+	if (state->result->HasError()) {
+		throw IOException("openzl_promote: %s", state->result->GetError());
+	}
+	return std::move(state);
+}
+
+static void OpenzlPromoteFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<OpenzlPromoteGlobalState>();
+	auto chunk = state.result->Fetch();
+	if (state.result->HasError()) {
+		throw IOException("openzl_promote: %s", state.result->GetError());
+	}
+	if (!chunk || chunk->size() == 0) {
+		output.SetCardinality(0);
+		return;
+	}
+	output.Reference(*chunk);
+}
+
+static TableFunction GetOpenzlPromoteFunction() {
+	TableFunction function("openzl_promote", {LogicalType::VARCHAR}, OpenzlPromoteFunction, OpenzlPromoteBind,
+	                        OpenzlPromoteInitGlobal);
+	function.named_parameters["max_int_digits"] = LogicalType::BIGINT;
+	function.named_parameters["decimal_int_digits"] = LogicalType::BIGINT;
+	function.named_parameters["decimal_scale"] = LogicalType::BIGINT;
+	function.named_parameters["promote_decimal"] = LogicalType::BOOLEAN;
+	return function;
+}
+
 // COPY tbl TO 'data.zl' (FORMAT OPENZL)
 //
 // Delegates entirely to the catalog's registered "parquet" CopyFunction to do
@@ -705,6 +877,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	loader.RegisterFunction(GetOpenzlCopyFunction());
 	loader.RegisterFunction(GetOpenzlTrainFunction());
+	loader.RegisterFunction(GetOpenzlPromoteFunction());
 }
 
 void OpenzlExtension::Load(ExtensionLoader &loader) {

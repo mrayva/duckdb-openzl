@@ -411,3 +411,57 @@ statement error
 SELECT * FROM openzl_train(['__TEST_DIR__/openzl_train_1.parquet'], NULL, no_ace_successors := true, benchmark := true, benchmark_files := ['/nonexistent/held_out.parquet']);
 ----
 benchmark file not found
+
+# ---- openzl_promote: lossless VARCHAR -> numeric promotion ----
+
+statement ok
+CREATE TABLE raw_txt AS SELECT * FROM (VALUES
+    ('1',   '4.16',  '007', 'AAPL', NULL::VARCHAR, '12345678901234567890', '1', '5'),
+    ('-20', '.5',    '8',   'MSFT', NULL, '1',                    '2', 'x'),
+    (NULL,  '100',   '9',   'GOOG', NULL, '2',                    '3', '7')
+) t(i, d, z, s, n, big, m, mixed);
+
+query IIIIIIII
+SELECT typeof(i), typeof(d), typeof(z), typeof(s), typeof(n), typeof(big), typeof(m), typeof(mixed) FROM openzl_promote('raw_txt') LIMIT 1;
+----
+BIGINT	DECIMAL(18,6)	VARCHAR	VARCHAR	VARCHAR	VARCHAR	BIGINT	VARCHAR
+
+# Values survive the promotion (numerically exact; formatting can differ).
+query III
+SELECT i, d, m FROM openzl_promote('raw_txt') ORDER BY m;
+----
+1	4.160000	1
+-20	0.500000	2
+NULL	100.000000	3
+
+# Limits are tunable: a 1-digit integer limit rejects -20 as BIGINT (it still
+# fits the decimal form, so the column becomes DECIMAL(13,1)), and a scale of 1
+# rejects 4.16, so that column stays text.
+query II
+SELECT typeof(i), typeof(d) FROM openzl_promote('raw_txt', max_int_digits := 1, decimal_scale := 1) LIMIT 1;
+----
+DECIMAL(13,1)	VARCHAR
+
+query I
+SELECT typeof(d) FROM openzl_promote('raw_txt', promote_decimal := false) LIMIT 1;
+----
+VARCHAR
+
+statement error
+SELECT * FROM openzl_promote('no_such_table');
+----
+cannot read
+
+statement error
+SELECT * FROM openzl_promote('raw_txt; DROP TABLE raw_txt');
+----
+expected a table or view name
+
+# Non-VARCHAR columns pass through; the promoted table exports and reads back.
+statement ok
+COPY (SELECT * FROM openzl_promote('raw_txt')) TO '__TEST_DIR__/openzl_promoted.zl' (FORMAT OPENZL);
+
+query IIII
+SELECT typeof(i), typeof(d), count(*), sum(m) FROM read_openzl('__TEST_DIR__/openzl_promoted.zl') GROUP BY 1, 2;
+----
+BIGINT	DECIMAL(18,6)	3	6

@@ -395,6 +395,39 @@ Two build gotchas worth knowing if you touch this again:
   500MB (raising it is opt-in), and chunking (next section) keeps every
   compress call inside it for tables of any size.
 
+## Typed columns from text: `openzl_promote`
+
+A raw mirror often keeps every CSV column as VARCHAR (DuckDB's type sniffing
+silently drops non-conforming rows under `ignore_errors=true`, so text is the
+safe way to load). Numbers stored as text compress noticeably worse -- on a
+13M-row market-data table, 193.3MB -> 166.1MB (-14%) once its numeric columns
+were typed. `openzl_promote` gives you the typed version without altering the
+source table and without risking data loss:
+
+```sql
+COPY (SELECT * FROM openzl_promote('tbl')) TO 'tbl.zl' (FORMAT OPENZL);
+```
+
+It scans the table once to decide, then streams it with the casts applied. A
+VARCHAR column becomes `BIGINT` only if **every** non-null value is an exact
+integer (`0`, or `-?[1-9]` and up to 17 more digits: no leading zeros, `+`
+signs or spaces), else `DECIMAL(18,6)` if every non-null value is a plain
+decimal that fits (only formatting can differ: `9.30` reads back as `9.3`,
+`.5` as `0.5`). Everything else -- text, codes like `007`, all-NULL columns,
+non-VARCHAR columns -- passes through unchanged.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `max_int_digits` | 18 | Longest integer promoted to `BIGINT` (1-18). |
+| `decimal_int_digits` | 12 | Integer-part digits allowed in the decimal form. |
+| `decimal_scale` | 6 | Fractional digits allowed; the type is `DECIMAL(decimal_int_digits + decimal_scale, decimal_scale)`, at most 18 total. |
+| `promote_decimal` | `true` | `false` = only ever promote to `BIGINT`. |
+
+The table is read through a second connection (committed data only) and the
+scan is single-threaded. Narrower integer widths (`TINYINT`, `INTEGER`, ...)
+measured no smaller in OpenZL -- it narrows integers itself -- and would make
+column types vary per table, so they are not offered.
+
 ## Large tables: automatic chunking
 
 `COPY ... (FORMAT OPENZL)` bounds its memory by *chunk*, not table: once the
