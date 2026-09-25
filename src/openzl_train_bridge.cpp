@@ -79,7 +79,7 @@ std::string NumberedPath(const std::string &output_path, size_t i) {
 } // namespace
 
 std::vector<TrainedOutput> Train(const std::vector<std::string> &sample_paths, const std::string &output_path,
-                                  const TrainOptions &opts) {
+                                 const TrainOptions &opts) {
 	if (sample_paths.empty()) {
 		throw Error("openzl_bridge: Train() requires at least one sample file");
 	}
@@ -89,8 +89,8 @@ std::vector<TrainedOutput> Train(const std::vector<std::string> &sample_paths, c
 		}
 	}
 
-	openzl::tools::logger::Logger::instance().setGlobalLoggerVerbosity(
-	    opts.verbose ? openzl::tools::logger::VERBOSE1 : openzl::tools::logger::ERRORS);
+	openzl::tools::logger::Logger::instance().setGlobalLoggerVerbosity(opts.verbose ? openzl::tools::logger::VERBOSE1
+	                                                                                : openzl::tools::logger::ERRORS);
 
 	try {
 		std::vector<std::string> selected_paths = SelectSamplePaths(sample_paths, opts);
@@ -114,7 +114,7 @@ std::vector<TrainedOutput> Train(const std::vector<std::string> &sample_paths, c
 		graph_opts.format_version = opts.format_version;
 		graph_opts.parquet_chunk_bytes = opts.parquet_chunk_bytes;
 		ValidateGraphOptions(graph_opts);
-		openzl::Compressor compressor = BuildParquetCompressor(opts.parquet_chunk_bytes);
+		openzl::Compressor compressor = BuildParquetCompressor(ResolveParquetChunkBytes(graph_opts));
 		// Same requirement as CompressParquet(): required when driving the C++
 		// API directly, or training fails with "Compressor format version is
 		// not set" the first time it tries to compress a candidate.
@@ -124,7 +124,7 @@ std::vector<TrainedOutput> Train(const std::vector<std::string> &sample_paths, c
 
 		openzl::training::TrainParams params;
 		params.compressorGenFunc = [](openzl::poly::string_view serialized,
-		                               openzl::poly::string_view fatBundle) -> std::unique_ptr<openzl::Compressor> {
+		                              openzl::poly::string_view fatBundle) -> std::unique_ptr<openzl::Compressor> {
 			return openzl::custom_parsers::createCompressorFromSerialized(serialized, fatBundle);
 		};
 		if (opts.threads > 0) {
@@ -151,7 +151,8 @@ std::vector<TrainedOutput> Train(const std::vector<std::string> &sample_paths, c
 			params.maxNumCandidates = opts.max_num_candidates;
 		}
 
-		std::vector<openzl::training::TrainedCandidate> candidates = openzl::training::train(inputs, compressor, params);
+		std::vector<openzl::training::TrainedCandidate> candidates =
+		    openzl::training::train(inputs, compressor, params);
 		if (candidates.empty()) {
 			throw Error("openzl_bridge: training produced no candidates");
 		}

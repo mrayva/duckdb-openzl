@@ -29,7 +29,7 @@ constexpr size_t BUFFER_SCHEME_LEN = 16; // strlen("openzl-buffer://")
 } // namespace
 
 OpenzlFileHandle::OpenzlFileHandle(FileSystem &file_system, string path, FileOpenFlags flags,
-                                    std::shared_ptr<const string> decompressed_bytes)
+                                   std::shared_ptr<const string> decompressed_bytes)
     : FileHandle(file_system, std::move(path), flags), data(std::move(decompressed_bytes)) {
 }
 
@@ -86,8 +86,7 @@ bool SplitChunkSuffix(const string &real_path, string &archive, idx_t &chunk) {
 		return false;
 	}
 	auto digits = real_path.substr(pos + marker.size());
-	if (digits.empty() || digits.size() > 15 ||
-	    digits.find_first_not_of("0123456789") != string::npos) {
+	if (digits.empty() || digits.size() > 15 || digits.find_first_not_of("0123456789") != string::npos) {
 		return false;
 	}
 	archive = real_path.substr(0, pos);
@@ -101,11 +100,11 @@ bool OpenzlFileSystem::CanHandleFile(const string &fpath) {
 }
 
 unique_ptr<FileHandle> OpenzlFileSystem::OpenFile(const string &path, FileOpenFlags flags,
-                                                   optional_ptr<FileOpener> opener) {
+                                                  optional_ptr<FileOpener> opener) {
 	if (flags.OpenForWriting()) {
 		throw NotImplementedException("OpenzlFileSystem: \"%s\" is read-only (openzl:// archives can't be written to "
-		                               "directly -- use COPY ... FORMAT OPENZL or openzl_compress instead)",
-		                               path);
+		                              "directly -- use COPY ... FORMAT OPENZL or openzl_compress instead)",
+		                              path);
 	}
 	string real_path = StripScheme(path);
 	string archive_path = real_path;
@@ -122,9 +121,8 @@ unique_ptr<FileHandle> OpenzlFileSystem::OpenFile(const string &path, FileOpenFl
 	std::shared_ptr<const string> data = entry.data.lock();
 	if (!data || entry.size != size || entry.mtime != mtime) {
 		try {
-			data = std::make_shared<const string>(
-			    is_chunk ? openzl_bridge::DecompressChunkToBuffer(archive_path, chunk)
-			             : openzl_bridge::DecompressToBuffer(archive_path));
+			data = std::make_shared<const string>(is_chunk ? openzl_bridge::DecompressChunkToBuffer(archive_path, chunk)
+			                                               : openzl_bridge::DecompressToBuffer(archive_path));
 		} catch (const openzl_bridge::Error &e) {
 			throw IOException("OpenzlFileSystem: %s", e.what());
 		}
@@ -139,7 +137,7 @@ void OpenzlFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, 
 	auto &h = handle.Cast<OpenzlFileHandle>();
 	if (location + nr_bytes > h.data->size()) {
 		throw IOException("OpenzlFileSystem: attempted to read past the end of decompressed archive \"%s\"",
-		                   handle.GetPath());
+		                  handle.GetPath());
 	}
 	memcpy(buffer, h.data->data() + location, static_cast<size_t>(nr_bytes));
 }
@@ -219,7 +217,7 @@ vector<OpenFileInfo> OpenzlFileSystem::Glob(const string &path, FileOpener *open
 // ---- OpenzlBufferFileSystem: writable in-memory staging buffers ----
 
 OpenzlBufferFileHandle::OpenzlBufferFileHandle(FileSystem &file_system, string path, FileOpenFlags flags,
-                                                std::shared_ptr<string> buffer_p)
+                                               std::shared_ptr<string> buffer_p)
     : FileHandle(file_system, std::move(path), flags), buffer(std::move(buffer_p)) {
 }
 
@@ -234,7 +232,7 @@ std::unordered_map<string, std::shared_ptr<string>> &OpenzlBufferFileSystem::Buf
 }
 
 string OpenzlBufferFileSystem::GenerateUniquePath() {
-	static std::atomic<uint64_t> counter{0};
+	static std::atomic<uint64_t> counter {0};
 	return string(BUFFER_SCHEME) + std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
 }
 
@@ -260,7 +258,7 @@ bool OpenzlBufferFileSystem::CanHandleFile(const string &fpath) {
 }
 
 unique_ptr<FileHandle> OpenzlBufferFileSystem::OpenFile(const string &path, FileOpenFlags flags,
-                                                         optional_ptr<FileOpener> opener) {
+                                                        optional_ptr<FileOpener> opener) {
 	std::shared_ptr<string> buffer;
 	{
 		std::lock_guard<std::mutex> lock(Mutex());
@@ -294,8 +292,7 @@ int64_t OpenzlBufferFileSystem::Write(FileHandle &handle, void *buffer, int64_t 
 void OpenzlBufferFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto &h = handle.Cast<OpenzlBufferFileHandle>();
 	if (location + nr_bytes > h.buffer->size()) {
-		throw IOException("OpenzlBufferFileSystem: attempted to read past the end of buffer \"%s\"",
-		                   handle.GetPath());
+		throw IOException("OpenzlBufferFileSystem: attempted to read past the end of buffer \"%s\"", handle.GetPath());
 	}
 	memcpy(buffer, h.buffer->data() + location, static_cast<size_t>(nr_bytes));
 }

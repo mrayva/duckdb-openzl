@@ -61,7 +61,8 @@ static openzl_bridge::GraphOptions OpenzlDefaultGraphOptions(ClientContext &cont
 		g.profile = v.ToString();
 	}
 	if (context.TryGetCurrentSetting("openzl_parquet_chunk_bytes", v) && !v.IsNull()) {
-		g.parquet_chunk_bytes = static_cast<size_t>(v.GetValue<uint64_t>());
+		auto bytes = v.GetValue<int64_t>();
+		g.parquet_chunk_bytes = bytes < 0 ? openzl_bridge::kAutoParquetChunkBytes : static_cast<size_t>(bytes);
 	}
 	return g;
 }
@@ -103,9 +104,9 @@ inline void OpenzlCompressFun(DataChunk &args, ExpressionState &state, Vector &r
 	    input_vec, output_vec, result, args.size(), [&](string_t input_path, string_t output_path) {
 		    try {
 			    openzl_bridge::CompressParquet(input_path.GetString(), output_path.GetString(), string(),
-			                                    OpenzlDefaultCompressionLevel(state.GetContext()),
-					                                OpenzlMaxCompressBytes(state.GetContext()),
-			                                OpenzlDefaultGraphOptions(state.GetContext()));
+			                                   OpenzlDefaultCompressionLevel(state.GetContext()),
+			                                   OpenzlMaxCompressBytes(state.GetContext()),
+			                                   OpenzlDefaultGraphOptions(state.GetContext()));
 		    } catch (const openzl_bridge::Error &e) {
 			    throw IOException(e.what());
 		    }
@@ -141,8 +142,8 @@ inline void OpenzlCompressWithOptionsFun(DataChunk &args, ExpressionState &state
 		}
 		try {
 			openzl_bridge::CompressParquet(input_path, output_path, trained_path, compression_level,
-			                                OpenzlMaxCompressBytes(state.GetContext()),
-			                                OpenzlDefaultGraphOptions(state.GetContext()));
+			                               OpenzlMaxCompressBytes(state.GetContext()),
+			                               OpenzlDefaultGraphOptions(state.GetContext()));
 		} catch (const openzl_bridge::Error &e) {
 			throw IOException(e.what());
 		}
@@ -178,10 +179,9 @@ inline void OpenzlCompressWithBlobOptionsFun(DataChunk &args, ExpressionState &s
 			}
 		}
 		try {
-			openzl_bridge::CompressParquetWithCompressorBytes(input_path, output_path, compressor_bytes,
-			                                                   compression_level,
-			                                                   OpenzlMaxCompressBytes(state.GetContext()),
-			                                OpenzlDefaultGraphOptions(state.GetContext()));
+			openzl_bridge::CompressParquetWithCompressorBytes(
+			    input_path, output_path, compressor_bytes, compression_level,
+			    OpenzlMaxCompressBytes(state.GetContext()), OpenzlDefaultGraphOptions(state.GetContext()));
 		} catch (const openzl_bridge::Error &e) {
 			throw IOException(e.what());
 		}
@@ -215,9 +215,11 @@ inline void OpenzlChunkCountFun(DataChunk &args, ExpressionState &state, Vector 
 // the same mechanism extensions like httpfs use for "s3://"/"https://".
 // Each call re-decompresses (no cross-call caching), so repeated reads of
 // the same archive cost repeated decompression, not repeated disk I/O.
-static const DefaultTableMacro OpenzlReadMacro = {DEFAULT_SCHEMA, "read_openzl", {"path", nullptr},
-                                                   {{nullptr, nullptr}},
-                                                   R"(SELECT * FROM read_parquet('openzl://' || path))"};
+static const DefaultTableMacro OpenzlReadMacro = {DEFAULT_SCHEMA,
+                                                  "read_openzl",
+                                                  {"path", nullptr},
+                                                  {{nullptr, nullptr}},
+                                                  R"(SELECT * FROM read_parquet('openzl://' || path))"};
 
 // openzl_train(sample_paths, output_path[, named options...]) -> table
 //
@@ -280,12 +282,12 @@ static openzl_bridge::ClusteringTrainer ParseClusteringTrainer(const string &val
 	if (value == "full_split") {
 		return openzl_bridge::ClusteringTrainer::FullSplit;
 	}
-	throw BinderException(
-	    "openzl_train: clustering_trainer must be 'greedy', 'bottom_up', or 'full_split', got '" + value + "'");
+	throw BinderException("openzl_train: clustering_trainer must be 'greedy', 'bottom_up', or 'full_split', got '" +
+	                      value + "'");
 }
 
 static unique_ptr<FunctionData> OpenzlTrainBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs[0].IsNull() || input.inputs[0].type().id() != LogicalTypeId::LIST) {
 		throw BinderException(
 		    "openzl_train: first argument must be a list of sample file paths, e.g. ['a.parquet', 'b.parquet']");
@@ -316,8 +318,8 @@ static unique_ptr<FunctionData> OpenzlTrainBind(ClientContext &context, TableFun
 	{
 		auto g = OpenzlDefaultGraphOptions(context);
 		opts.format_version = static_cast<int>(GetNamedBigint(input, "format_version", g.format_version));
-		opts.parquet_chunk_bytes = static_cast<size_t>(
-		    GetNamedBigint(input, "parquet_chunk_bytes", static_cast<int64_t>(g.parquet_chunk_bytes)));
+		auto chunk = GetNamedBigint(input, "parquet_chunk_bytes", -1);
+		opts.parquet_chunk_bytes = chunk < 0 ? g.parquet_chunk_bytes : static_cast<size_t>(chunk);
 	}
 	{
 		auto bench_it = input.named_parameters.find("benchmark");
@@ -362,7 +364,7 @@ struct OpenzlTrainGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<GlobalTableFunctionState> OpenzlTrainInitGlobal(ClientContext &context,
-                                                                   TableFunctionInitInput &input) {
+                                                                  TableFunctionInitInput &input) {
 	return make_uniq<OpenzlTrainGlobalState>();
 }
 
@@ -379,7 +381,8 @@ static void OpenzlTrainFunction(ClientContext &context, TableFunctionInput &data
 		output.SetValue(0, count, Value::BIGINT(static_cast<int64_t>(gstate.offset)));
 		output.SetValue(1, count, out.path.empty() ? Value(LogicalType::VARCHAR) : Value(out.path));
 		output.SetValue(2, count, Value::BLOB_RAW(out.compressor_bytes));
-		output.SetValue(3, count, out.has_benchmark ? Value::DOUBLE(out.compression_ratio) : Value(LogicalType::DOUBLE));
+		output.SetValue(3, count,
+		                out.has_benchmark ? Value::DOUBLE(out.compression_ratio) : Value(LogicalType::DOUBLE));
 		output.SetValue(4, count, out.has_benchmark ? Value::DOUBLE(out.compress_mb_s) : Value(LogicalType::DOUBLE));
 		output.SetValue(5, count, out.has_benchmark ? Value::DOUBLE(out.decompress_mb_s) : Value(LogicalType::DOUBLE));
 		gstate.offset++;
@@ -390,7 +393,7 @@ static void OpenzlTrainFunction(ClientContext &context, TableFunctionInput &data
 
 static TableFunction GetOpenzlTrainFunction() {
 	TableFunction function("openzl_train", {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
-	                        OpenzlTrainFunction, OpenzlTrainBind, OpenzlTrainInitGlobal);
+	                       OpenzlTrainFunction, OpenzlTrainBind, OpenzlTrainInitGlobal);
 	function.named_parameters["threads"] = LogicalType::BIGINT;
 	function.named_parameters["clustering_trainer"] = LogicalType::VARCHAR;
 	function.named_parameters["num_samples"] = LogicalType::BIGINT;
@@ -410,7 +413,6 @@ static TableFunction GetOpenzlTrainFunction() {
 	function.named_parameters["benchmark_files"] = LogicalType::LIST(LogicalType::VARCHAR);
 	return function;
 }
-
 
 // openzl_promote(table[, max_int_digits := 18, decimal_int_digits := 12,
 //                 decimal_scale := 6, promote_decimal := true]) -> table
@@ -444,7 +446,7 @@ static string OpenzlPromoteIdent(const string &name) {
 }
 
 static unique_ptr<FunctionData> OpenzlPromoteBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("openzl_promote: table name must not be NULL");
 	}
@@ -460,7 +462,8 @@ static unique_ptr<FunctionData> OpenzlPromoteBind(ClientContext &context, TableF
 		throw BinderException("openzl_promote: max_int_digits must be between 1 and 18");
 	}
 	if (dec_scale < 1 || dec_int_digits < 1 || dec_int_digits + dec_scale > 18) {
-		throw BinderException("openzl_promote: decimal_scale and decimal_int_digits must be >= 1 and sum to at most 18");
+		throw BinderException(
+		    "openzl_promote: decimal_scale and decimal_int_digits must be >= 1 and sum to at most 18");
 	}
 
 	Connection con(DatabaseInstance::GetDatabase(context));
@@ -477,7 +480,8 @@ static unique_ptr<FunctionData> OpenzlPromoteBind(ClientContext &context, TableF
 
 	string int_re = "(0|-?[1-9][0-9]{0," + std::to_string(max_int_digits - 1) + "})";
 	string frac = "[0-9]{1," + std::to_string(dec_scale) + "}";
-	string dec_re = "-?((0|[1-9][0-9]{0," + std::to_string(dec_int_digits - 1) + "})(\\." + frac + ")?|\\." + frac + ")";
+	string dec_re =
+	    "-?((0|[1-9][0-9]{0," + std::to_string(dec_int_digits - 1) + "})(\\." + frac + ")?|\\." + frac + ")";
 	string dec_type = "DECIMAL(" + std::to_string(dec_int_digits + dec_scale) + "," + std::to_string(dec_scale) + ")";
 
 	string aggs;
@@ -549,7 +553,7 @@ struct OpenzlPromoteGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<GlobalTableFunctionState> OpenzlPromoteInitGlobal(ClientContext &context,
-                                                                     TableFunctionInitInput &input) {
+                                                                    TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<OpenzlPromoteBindData>();
 	auto state = make_uniq<OpenzlPromoteGlobalState>();
 	state->con = make_uniq<Connection>(DatabaseInstance::GetDatabase(context));
@@ -575,7 +579,7 @@ static void OpenzlPromoteFunction(ClientContext &context, TableFunctionInput &da
 
 static TableFunction GetOpenzlPromoteFunction() {
 	TableFunction function("openzl_promote", {LogicalType::VARCHAR}, OpenzlPromoteFunction, OpenzlPromoteBind,
-	                        OpenzlPromoteInitGlobal);
+	                       OpenzlPromoteInitGlobal);
 	function.named_parameters["max_int_digits"] = LogicalType::BIGINT;
 	function.named_parameters["decimal_int_digits"] = LogicalType::BIGINT;
 	function.named_parameters["decimal_scale"] = LogicalType::BIGINT;
@@ -658,7 +662,7 @@ struct OpenzlCopyLocalState : public LocalFunctionData {
 };
 
 static unique_ptr<FunctionData> OpenzlCopyBind(ClientContext &context, CopyFunctionBindInput &input,
-                                                const vector<string> &names, const vector<LogicalType> &sql_types) {
+                                               const vector<string> &names, const vector<LogicalType> &sql_types) {
 	auto &parquet_entry =
 	    Catalog::GetEntry<CopyFunctionCatalogEntry>(context, SYSTEM_CATALOG, DEFAULT_SCHEMA, "parquet");
 
@@ -751,7 +755,7 @@ static void OpenzlStartChunk(ClientContext &context, OpenzlCopyBindData &bind_da
 	// since it opens whatever path we hand it via the database's normal
 	// (dispatching) filesystem either way.
 	gstate.tmp_parquet_path = bind_data.in_memory ? OpenzlBufferFileSystem::GenerateUniquePath()
-	                                               : gstate.final_zl_path + ".openzl_staging.parquet";
+	                                              : gstate.final_zl_path + ".openzl_staging.parquet";
 	gstate.parquet_global_state = bind_data.parquet_copy_function.copy_to_initialize_global(
 	    context, *bind_data.parquet_bind_data, gstate.tmp_parquet_path);
 	gstate.current_chunk_open = true;
@@ -761,7 +765,7 @@ static void OpenzlStartChunk(ClientContext &context, OpenzlCopyBindData &bind_da
 // the frame to the archive; removes the staging file/buffer either way.
 static void OpenzlEndChunk(ClientContext &context, OpenzlCopyBindData &bind_data, OpenzlCopyGlobalState &gstate) {
 	bind_data.parquet_copy_function.copy_to_finalize(context, *bind_data.parquet_bind_data,
-	                                                  *gstate.parquet_global_state);
+	                                                 *gstate.parquet_global_state);
 	gstate.parquet_global_state.reset();
 	gstate.current_chunk_open = false;
 	std::string frame;
@@ -770,8 +774,8 @@ static void OpenzlEndChunk(ClientContext &context, OpenzlCopyBindData &bind_data
 			// TakeBuffer() removes the entry regardless of what happens next.
 			std::string canonical_bytes = OpenzlBufferFileSystem::TakeBuffer(gstate.tmp_parquet_path);
 			frame = openzl_bridge::CompressParquetBytesToString(canonical_bytes, bind_data.trained_compressor_path,
-			                                                     bind_data.compression_level,
-			                                                     bind_data.max_compress_bytes, bind_data.graph);
+			                                                    bind_data.compression_level,
+			                                                    bind_data.max_compress_bytes, bind_data.graph);
 		} else {
 			// Read the staged file, refusing an oversized one before allocating.
 			std::string canonical_bytes;
@@ -793,8 +797,8 @@ static void OpenzlEndChunk(ClientContext &context, OpenzlCopyBindData &bind_data
 				f.read(&canonical_bytes[0], static_cast<std::streamsize>(size));
 			}
 			frame = openzl_bridge::CompressParquetBytesToString(canonical_bytes, bind_data.trained_compressor_path,
-			                                                     bind_data.compression_level,
-			                                                     bind_data.max_compress_bytes, bind_data.graph);
+			                                                    bind_data.compression_level,
+			                                                    bind_data.max_compress_bytes, bind_data.graph);
 		}
 	} catch (const openzl_bridge::Error &e) {
 		if (!bind_data.in_memory) {
@@ -824,7 +828,7 @@ static size_t OpenzlStagedBytes(OpenzlCopyBindData &bind_data, OpenzlCopyGlobalS
 }
 
 static unique_ptr<GlobalFunctionData> OpenzlCopyInitGlobal(ClientContext &context, FunctionData &bind_data_p,
-                                                            const string &file_path) {
+                                                           const string &file_path) {
 	auto &bind_data = bind_data_p.Cast<OpenzlCopyBindData>();
 	auto result = make_uniq<OpenzlCopyGlobalState>();
 	result->final_zl_path = file_path;
@@ -842,7 +846,7 @@ static unique_ptr<LocalFunctionData> OpenzlCopyInitLocal(ExecutionContext &conte
 }
 
 static void OpenzlCopySink(ExecutionContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate_p,
-                            LocalFunctionData &lstate_p, DataChunk &input) {
+                           LocalFunctionData &lstate_p, DataChunk &input) {
 	auto &bind_data = bind_data_p.Cast<OpenzlCopyBindData>();
 	auto &gstate = gstate_p.Cast<OpenzlCopyGlobalState>();
 	auto &lstate = lstate_p.Cast<OpenzlCopyLocalState>();
@@ -851,23 +855,23 @@ static void OpenzlCopySink(ExecutionContext &context, FunctionData &bind_data_p,
 	// parquet global/local state here is safe.
 	if (bind_data.chunk_size_bytes > 0 && OpenzlStagedBytes(bind_data, gstate) >= bind_data.chunk_size_bytes) {
 		bind_data.parquet_copy_function.copy_to_combine(context, *bind_data.parquet_bind_data,
-		                                                 *gstate.parquet_global_state, *lstate.parquet_local_state);
+		                                                *gstate.parquet_global_state, *lstate.parquet_local_state);
 		OpenzlEndChunk(context.client, bind_data, gstate);
 		OpenzlStartChunk(context.client, bind_data, gstate);
 		lstate.parquet_local_state =
 		    bind_data.parquet_copy_function.copy_to_initialize_local(context, *bind_data.parquet_bind_data);
 	}
 	bind_data.parquet_copy_function.copy_to_sink(context, *bind_data.parquet_bind_data, *gstate.parquet_global_state,
-	                                              *lstate.parquet_local_state, input);
+	                                             *lstate.parquet_local_state, input);
 }
 
 static void OpenzlCopyCombine(ExecutionContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate_p,
-                               LocalFunctionData &lstate_p) {
+                              LocalFunctionData &lstate_p) {
 	auto &bind_data = bind_data_p.Cast<OpenzlCopyBindData>();
 	auto &gstate = gstate_p.Cast<OpenzlCopyGlobalState>();
 	auto &lstate = lstate_p.Cast<OpenzlCopyLocalState>();
-	bind_data.parquet_copy_function.copy_to_combine(context, *bind_data.parquet_bind_data,
-	                                                 *gstate.parquet_global_state, *lstate.parquet_local_state);
+	bind_data.parquet_copy_function.copy_to_combine(context, *bind_data.parquet_bind_data, *gstate.parquet_global_state,
+	                                                *lstate.parquet_local_state);
 }
 
 static void OpenzlCopyFinalize(ClientContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate_p) {
@@ -895,7 +899,7 @@ static CopyFunction GetOpenzlCopyFunction() {
 
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ScalarFunction("openzl_decompress", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                        LogicalType::VARCHAR, OpenzlDecompressFun));
+	                                       LogicalType::VARCHAR, OpenzlDecompressFun));
 
 	ScalarFunctionSet openzl_compress_set("openzl_compress");
 	openzl_compress_set.AddFunction(
@@ -908,7 +912,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// generic graph ('' or NULL, per the doc comments below) or erroring
 	// (a NULL trained_compressor_bytes blob) the way we actually want.
 	ScalarFunction compress_trained_path({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                      LogicalType::VARCHAR, OpenzlCompressWithOptionsFun);
+	                                     LogicalType::VARCHAR, OpenzlCompressWithOptionsFun);
 	compress_trained_path.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	openzl_compress_set.AddFunction(compress_trained_path);
 
@@ -921,7 +925,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// BLOB overloads: trained compressor as in-memory bytes (e.g. from a
 	// table column) instead of a file path.
 	ScalarFunction compress_trained_blob({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BLOB},
-	                                      LogicalType::VARCHAR, OpenzlCompressWithBlobOptionsFun);
+	                                     LogicalType::VARCHAR, OpenzlCompressWithBlobOptionsFun);
 	compress_trained_blob.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	openzl_compress_set.AddFunction(compress_trained_blob);
 
@@ -943,7 +947,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption("openzl_max_compress_bytes",
 	                          "Refuse to OpenZL-compress a single canonical-parquet input larger than this many bytes "
-	                          "(memory guard: compression peaks at ~4x the input in RAM). Default 500000000 (OpenZL's documented per-payload limit; raising it is unsupported upstream).",
+	                          "(memory guard: compression peaks at ~4x the input in RAM). Default 500000000 (OpenZL's "
+	                          "documented per-payload limit; raising it is unsupported upstream).",
 	                          LogicalType::UBIGINT, Value::UBIGINT(openzl_bridge::kDefaultMaxCompressBytes));
 	config.AddExtensionOption("openzl_compression_level",
 	                          "Default OpenZL compression level (1-9, default 9) for openzl_compress, COPY ... (FORMAT "
@@ -965,16 +970,22 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::VARCHAR, Value("parquet"));
 	config.AddExtensionOption("openzl_parquet_chunk_bytes",
 	                          "Parquet profile: split the input into independently compressed chunks of about this "
-	                          "many bytes inside each frame (0 = no internal chunking). Needs format version >= 21.",
-	                          LogicalType::UBIGINT, Value::UBIGINT(0));
+	                          "many bytes inside each frame. -1 (default) = auto: 20000000 when the format version "
+	                          "allows it (>= 21), else none; 0 = never; other values need format version >= 21.",
+	                          LogicalType::BIGINT, Value::BIGINT(-1),
+	                          [](ClientContext &context, SetScope scope, Value &parameter) {
+		                          if (parameter.GetValue<int64_t>() < -1) {
+			                          throw InvalidInputException("openzl_parquet_chunk_bytes must be >= -1");
+		                          }
+	                          });
 	config.AddExtensionOption("openzl_chunk_size_bytes",
 	                          "COPY ... (FORMAT OPENZL) starts a new independent chunk once the staged parquet reaches "
 	                          "this many bytes, bounding peak memory regardless of table size; 0 disables chunking. "
 	                          "Default 256000000. Overridable per COPY with CHUNK_SIZE_BYTES.",
 	                          LogicalType::UBIGINT, Value::UBIGINT(openzl_bridge::kDefaultChunkBytes));
 
-	loader.RegisterFunction(ScalarFunction("openzl_chunk_count", {LogicalType::VARCHAR}, LogicalType::BIGINT,
-	                                        OpenzlChunkCountFun));
+	loader.RegisterFunction(
+	    ScalarFunction("openzl_chunk_count", {LogicalType::VARCHAR}, LogicalType::BIGINT, OpenzlChunkCountFun));
 
 	auto read_openzl_info = DefaultTableFunctionGenerator::CreateTableMacroInfo(OpenzlReadMacro);
 	loader.RegisterFunction(*read_openzl_info);

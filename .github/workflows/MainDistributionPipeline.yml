@@ -19,6 +19,9 @@ jobs:
       duckdb_version: v1.5.4
       ci_tools_version: v1.5-variegata
       extension_name: openzl
+      # OpenZL's C sources use C11 constant-initializer forms that MSVC rejects
+      # (error C2099 in encoder_registry.c); the MinGW (gcc) Windows build is kept.
+      exclude_archs: 'windows_amd64'
 
   code-quality-check:
     name: Code Quality Check

@@ -48,6 +48,14 @@ constexpr size_t kDefaultChunkBytes = 256000000ULL;
 // Which OpenZL graph compresses the parquet bytes, and how the frame is
 // written. All fields are optional (defaults reproduce the historical
 // behavior). Decompression needs none of this: any frame decodes on its own.
+// Sentinel for GraphOptions::parquet_chunk_bytes: "use the default", which is
+// kDefaultParquetChunkBytes when the frame format supports internal chunking
+// (version >= 21) and no chunking otherwise. See ResolveParquetChunkBytes().
+constexpr size_t kAutoParquetChunkBytes = static_cast<size_t>(-1);
+// Upstream's `zli --profile parquet` default. Measured on 7 NYSE tables vs no
+// chunking: peak RSS -12..-27% (avg ~-19%), size -2.3%..+2.3% (avg ~-0.1%).
+constexpr size_t kDefaultParquetChunkBytes = 20000000ULL;
+
 struct GraphOptions {
 	// OpenZL frame format version to write: 0 = the newest this build supports
 	// (ZL_MAX_FORMAT_VERSION); otherwise 8..that maximum. Pin it to make
@@ -59,11 +67,15 @@ struct GraphOptions {
 	// "serial": generic byte compression, accepts any input.
 	std::string profile = "parquet";
 	// Parquet profile only: split the input into independently compressed
-	// chunks of about this many bytes inside the frame (0 = no internal
-	// chunking; upstream's zli uses 20000000). Needs format version >= 21. A
+	// chunks of about this many bytes inside the frame. kAutoParquetChunkBytes
+	// (the default) = 20MB when the format version allows it (>= 21), else none;
+	// 0 = never; any other value is explicit and needs format version >= 21. A
 	// trained compressor carries the value it was trained with instead.
-	size_t parquet_chunk_bytes = 0;
+	size_t parquet_chunk_bytes = kAutoParquetChunkBytes;
 };
+
+// The chunk size actually used for `g` (resolves the auto sentinel).
+size_t ResolveParquetChunkBytes(const GraphOptions &g);
 
 // Throws openzl_bridge::Error if `g` is invalid (unknown profile, format
 // version out of range, chunking with a format version that can't express it).
@@ -167,9 +179,8 @@ private:
 // Throws openzl_bridge::Error if the input exceeds a safe size (see
 // CompressParquet's .cpp for why) -- split the source into smaller chunks.
 void CompressParquet(const std::string &input_parquet_path, const std::string &output_zl_path,
-                      const std::string &trained_compressor_path = std::string(), int compression_level = 9,
-                      size_t max_input_bytes = kDefaultMaxCompressBytes,
-                      const GraphOptions &graph = GraphOptions());
+                     const std::string &trained_compressor_path = std::string(), int compression_level = 9,
+                     size_t max_input_bytes = kDefaultMaxCompressBytes, const GraphOptions &graph = GraphOptions());
 
 // Same as CompressParquet(), except the trained compressor is passed as
 // already-in-memory bytes (e.g. read from a BLOB column in a DuckDB table)
@@ -178,9 +189,9 @@ void CompressParquet(const std::string &input_parquet_path, const std::string &o
 // must be non-empty (there's no generic-graph fallback here; call
 // CompressParquet() directly for that).
 void CompressParquetWithCompressorBytes(const std::string &input_parquet_path, const std::string &output_zl_path,
-                                         const std::string &compressor_bytes, int compression_level = 9,
-                                         size_t max_input_bytes = kDefaultMaxCompressBytes,
-                                         const GraphOptions &graph = GraphOptions());
+                                        const std::string &compressor_bytes, int compression_level = 9,
+                                        size_t max_input_bytes = kDefaultMaxCompressBytes,
+                                        const GraphOptions &graph = GraphOptions());
 
 // Same as CompressParquet(), except the *input* is passed as already-in-memory
 // canonical parquet bytes rather than a file path -- for callers who write
@@ -191,16 +202,15 @@ void CompressParquetWithCompressorBytes(const std::string &input_parquet_path, c
 // concerns are independent, and there's currently no call site that needs an
 // in-memory *and* trained-as-bytes combination at once.
 void CompressParquetBytes(const std::string &canonical_parquet_bytes, const std::string &output_zl_path,
-                           const std::string &trained_compressor_path = std::string(), int compression_level = 9,
-                           size_t max_input_bytes = kDefaultMaxCompressBytes,
-                           const GraphOptions &graph = GraphOptions());
+                          const std::string &trained_compressor_path = std::string(), int compression_level = 9,
+                          size_t max_input_bytes = kDefaultMaxCompressBytes,
+                          const GraphOptions &graph = GraphOptions());
 
 // Same as CompressParquetBytes(), but returns the compressed OpenZL frame
 // instead of writing it -- for ChunkedArchiveWriter, which appends frames.
 std::string CompressParquetBytesToString(const std::string &canonical_parquet_bytes,
-                                          const std::string &trained_compressor_path = std::string(),
-                                          int compression_level = 9,
-                                          size_t max_input_bytes = kDefaultMaxCompressBytes,
-                                          const GraphOptions &graph = GraphOptions());
+                                         const std::string &trained_compressor_path = std::string(),
+                                         int compression_level = 9, size_t max_input_bytes = kDefaultMaxCompressBytes,
+                                         const GraphOptions &graph = GraphOptions());
 
 } // namespace openzl_bridge

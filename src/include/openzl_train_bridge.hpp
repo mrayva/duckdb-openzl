@@ -86,10 +86,11 @@ struct TrainOptions {
 
 	// Frame format version and parquet internal chunk size baked into the
 	// trained compressor (see GraphOptions in openzl_bridge.hpp; the parquet
-	// profile is the only one that can be trained here). 0 = newest / no
-	// internal chunking.
+	// profile is the only one that can be trained here). format_version 0 =
+	// newest; parquet_chunk_bytes defaults to kAutoParquetChunkBytes (20MB when
+	// the format version allows, else none), 0 = never.
 	int format_version = 0;
-	size_t parquet_chunk_bytes = 0;
+	size_t parquet_chunk_bytes = static_cast<size_t>(-1);
 
 	// Benchmarks each returned candidate (compression ratio, compress and
 	// decompress MB/s -- the numbers `zli train --pareto-frontier` writes to
@@ -141,6 +142,6 @@ struct TrainedOutput {
 // unreadable sample, non-canonical sample, training internal error, I/O
 // error writing output).
 std::vector<TrainedOutput> Train(const std::vector<std::string> &sample_paths, const std::string &output_path,
-                                  const TrainOptions &opts);
+                                 const TrainOptions &opts);
 
 } // namespace openzl_bridge

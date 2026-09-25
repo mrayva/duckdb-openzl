@@ -44,7 +44,7 @@ public:
 	bool CanHandleFile(const string &fpath) override;
 
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
-	                                 optional_ptr<FileOpener> opener = nullptr) override;
+	                                optional_ptr<FileOpener> opener = nullptr) override;
 
 	void Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Read(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
@@ -94,8 +94,7 @@ public:
 // across connections) never collide on the same key.
 class OpenzlBufferFileHandle : public FileHandle {
 public:
-	OpenzlBufferFileHandle(FileSystem &file_system, string path, FileOpenFlags flags,
-	                        std::shared_ptr<string> buffer);
+	OpenzlBufferFileHandle(FileSystem &file_system, string path, FileOpenFlags flags, std::shared_ptr<string> buffer);
 
 	void Close() override {
 	}
@@ -116,7 +115,7 @@ public:
 	bool CanHandleFile(const string &fpath) override;
 
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
-	                                 optional_ptr<FileOpener> opener = nullptr) override;
+	                                optional_ptr<FileOpener> opener = nullptr) override;
 
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override;

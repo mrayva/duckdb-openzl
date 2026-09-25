@@ -659,3 +659,64 @@ query I
 SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_v10.zl');
 ----
 1000
+
+# ---- default internal chunking (auto = 20MB when the format allows) ----
+
+statement ok
+CREATE TABLE big_txt AS SELECT range AS a, md5(range::VARCHAR) AS b, md5((range * 7)::VARCHAR) AS c FROM range(1500000);
+
+statement ok
+COPY big_txt TO '__TEST_DIR__/openzl_auto_chunk.zl' (FORMAT OPENZL);
+
+statement ok
+COPY big_txt TO '__TEST_DIR__/openzl_explicit_20m.zl' (FORMAT OPENZL, PARQUET_CHUNK_SIZE_BYTES 20000000);
+
+statement ok
+COPY big_txt TO '__TEST_DIR__/openzl_no_chunk.zl' (FORMAT OPENZL, PARQUET_CHUNK_SIZE_BYTES 0);
+
+# The default is exactly 20MB chunking, and it really differs from none for an
+# input bigger than one chunk.
+query II
+SELECT (SELECT content FROM read_blob('__TEST_DIR__/openzl_auto_chunk.zl')) =
+       (SELECT content FROM read_blob('__TEST_DIR__/openzl_explicit_20m.zl')),
+       (SELECT content FROM read_blob('__TEST_DIR__/openzl_auto_chunk.zl')) !=
+       (SELECT content FROM read_blob('__TEST_DIR__/openzl_no_chunk.zl'));
+----
+true	true
+
+query I
+SELECT (SELECT sum(a) FROM read_openzl('__TEST_DIR__/openzl_auto_chunk.zl')) =
+       (SELECT sum(a) FROM read_openzl('__TEST_DIR__/openzl_no_chunk.zl'));
+----
+true
+
+# The setting: -1 = auto, 0 = never, anything below -1 is rejected.
+statement ok
+SET openzl_parquet_chunk_bytes = 0;
+
+statement ok
+COPY big_txt TO '__TEST_DIR__/openzl_setting_no_chunk.zl' (FORMAT OPENZL);
+
+statement ok
+RESET openzl_parquet_chunk_bytes;
+
+query I
+SELECT (SELECT content FROM read_blob('__TEST_DIR__/openzl_setting_no_chunk.zl')) =
+       (SELECT content FROM read_blob('__TEST_DIR__/openzl_no_chunk.zl'));
+----
+true
+
+statement error
+SET openzl_parquet_chunk_bytes = -2;
+----
+must be >= -1
+
+# Pinning a format version below 21 quietly turns the default chunking off
+# (rather than failing); only an explicit chunk size is an error there.
+statement ok
+COPY t TO '__TEST_DIR__/openzl_v20_auto.zl' (FORMAT OPENZL, FORMAT_VERSION 20);
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_v20_auto.zl');
+----
+1000
