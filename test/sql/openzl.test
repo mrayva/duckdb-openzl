@@ -872,3 +872,47 @@ query I
 SELECT count(*) FROM openzl_promote('fw_edge', fixed_width := true) WHERE two IS NULL OR two = 1;
 ----
 2
+
+# ---- Writing through openzl:// (canonical parquet is OpenZL-compressed when the file is closed) ----
+statement ok
+COPY (SELECT range AS id, 'S' || (range % 50) AS s FROM range(20000)) TO 'openzl://__TEST_DIR__/openzl_write.zl' (FORMAT PARQUET, COMPRESSION 'uncompressed', DICTIONARY_SIZE_LIMIT 0);
+
+query II
+SELECT count(*), sum(id) FROM read_parquet('openzl://__TEST_DIR__/openzl_write.zl');
+----
+20000	199990000
+
+# Small non-canonical parquet (zstd + dictionary, e.g. DuckLake's delete files) falls back to the generic graph and still
+# round-trips; a large one is rejected with a pointer to the fix.
+statement ok
+COPY (SELECT range AS id, 'S' || (range % 50) AS s FROM range(20000)) TO 'openzl://__TEST_DIR__/openzl_write_small.zl' (FORMAT PARQUET);
+
+query II
+SELECT count(*), sum(id) FROM read_parquet('openzl://__TEST_DIR__/openzl_write_small.zl');
+----
+20000	199990000
+
+# The serial profile accepts any bytes.
+statement ok
+SET openzl_profile = 'serial';
+
+statement ok
+COPY (SELECT range AS id, 'S' || (range % 50) AS s FROM range(20000)) TO 'openzl://__TEST_DIR__/openzl_write_serial.zl' (FORMAT PARQUET);
+
+query I
+SELECT count(*) FROM read_parquet('openzl://__TEST_DIR__/openzl_write_serial.zl');
+----
+20000
+
+statement ok
+RESET openzl_profile;
+
+# FIELD_IDS pass through COPY ... FORMAT OPENZL (DuckLake identifies columns by parquet field ids).
+statement ok
+COPY (SELECT range AS id, 'x' AS s FROM range(10)) TO '__TEST_DIR__/openzl_fieldids.zl' (FORMAT OPENZL, FIELD_IDS {'id': 7, 's': 9});
+
+query II
+SELECT name, field_id FROM parquet_schema('openzl://__TEST_DIR__/openzl_fieldids.zl') WHERE name <> 'duckdb_schema' ORDER BY field_id;
+----
+id	7
+s	9

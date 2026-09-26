@@ -14,6 +14,7 @@
 #endif
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 
 #include "openzl_bridge.hpp"
@@ -101,15 +102,42 @@ bool OpenzlFileSystem::CanHandleFile(const string &fpath) {
 
 unique_ptr<FileHandle> OpenzlFileSystem::OpenFile(const string &path, FileOpenFlags flags,
                                                   optional_ptr<FileOpener> opener) {
-	if (flags.OpenForWriting()) {
-		throw NotImplementedException("OpenzlFileSystem: \"%s\" is read-only (openzl:// archives can't be written to "
-		                              "directly -- use COPY ... FORMAT OPENZL or openzl_compress instead)",
-		                              path);
-	}
 	string real_path = StripScheme(path);
 	string archive_path = real_path;
 	idx_t chunk = 0;
 	bool is_chunk = SplitChunkSuffix(real_path, archive_path, chunk);
+	if (flags.OpenForWriting()) {
+		if (is_chunk || flags.OpenForAppending() || flags.OpenForReading()) {
+			throw NotImplementedException("OpenzlFileSystem: \"%s\" can only be opened write-only to create a new "
+			                              "archive (no append, no read+write, no single-chunk paths)",
+			                              path);
+		}
+		auto handle = make_uniq<OpenzlFileHandle>(*this, path, flags, nullptr);
+		handle->write_buffer = std::make_shared<string>();
+		handle->real_path = real_path;
+		auto &s = handle->write_settings;
+		Value v;
+		if (FileOpener::TryGetCurrentSetting(opener, "openzl_compression_level", v) && !v.IsNull()) {
+			s.compression_level = static_cast<int>(v.GetValue<int64_t>());
+		}
+		if (FileOpener::TryGetCurrentSetting(opener, "openzl_max_compress_bytes", v) && !v.IsNull()) {
+			s.max_compress_bytes = static_cast<size_t>(v.GetValue<uint64_t>());
+		}
+		if (FileOpener::TryGetCurrentSetting(opener, "openzl_format_version", v) && !v.IsNull()) {
+			s.graph.format_version = static_cast<int>(v.GetValue<int64_t>());
+		}
+		if (FileOpener::TryGetCurrentSetting(opener, "openzl_profile", v) && !v.IsNull()) {
+			s.graph.profile = v.ToString();
+		}
+		if (FileOpener::TryGetCurrentSetting(opener, "openzl_permissive_compression", v) && !v.IsNull()) {
+			s.graph.permissive = v.GetValue<bool>() ? 1 : 0;
+		}
+		if (FileOpener::TryGetCurrentSetting(opener, "openzl_parquet_chunk_bytes", v) && !v.IsNull()) {
+			auto bytes = v.GetValue<int64_t>();
+			s.graph.parquet_chunk_bytes = bytes < 0 ? openzl_bridge::kAutoParquetChunkBytes : static_cast<size_t>(bytes);
+		}
+		return std::move(handle);
+	}
 	int64_t size = -1, mtime = -1;
 	StatArchive(archive_path, size, mtime);
 
@@ -133,28 +161,118 @@ unique_ptr<FileHandle> OpenzlFileSystem::OpenFile(const string &path, FileOpenFl
 	return make_uniq<OpenzlFileHandle>(*this, path, flags, std::move(data));
 }
 
+void OpenzlFileHandle::Close() {
+	if (!write_buffer || closed) {
+		return;
+	}
+	closed = true;
+	// Compress next to the destination and rename into place, so a reader never sees a half-written archive.
+	const string tmp_path = real_path + ".openzl_tmp";
+	try {
+		try {
+			openzl_bridge::CompressParquetBytes(*write_buffer, tmp_path, string(), write_settings.compression_level,
+			                                    write_settings.max_compress_bytes, write_settings.graph);
+		} catch (const openzl_bridge::Error &) {
+			// Hosts write some small side files that are not canonical parquet (DuckLake's delete files): store those
+			// with the generic graph rather than failing the write. A LARGE non-canonical file is still an error --
+			// silently storing it generically would cost most of OpenZL's gain and hide a misconfiguration.
+			constexpr size_t kSmallFallbackBytes = 64000000ULL;
+			if (write_settings.graph.profile == "serial" || write_buffer->size() > kSmallFallbackBytes) {
+				throw;
+			}
+			auto generic = write_settings.graph;
+			generic.profile = "serial";
+			generic.parquet_chunk_bytes = 0;
+			openzl_bridge::CompressParquetBytes(*write_buffer, tmp_path, string(), write_settings.compression_level,
+			                                    write_settings.max_compress_bytes, generic);
+		}
+	} catch (const openzl_bridge::Error &e) {
+		std::remove(tmp_path.c_str());
+		throw IOException("OpenzlFileSystem: cannot write \"%s\": %s (files written through openzl:// must be canonical "
+		                  "parquet -- uncompressed, plain-encoded, no dictionary -- unless SET openzl_profile = 'serial')",
+		                  GetPath(), e.what());
+	}
+	write_buffer.reset();
+	if (std::rename(tmp_path.c_str(), real_path.c_str()) != 0) {
+		std::remove(tmp_path.c_str());
+		throw IOException("OpenzlFileSystem: cannot move the finished archive into place at \"%s\"", real_path);
+	}
+}
+
 void OpenzlFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto &h = handle.Cast<OpenzlFileHandle>();
-	if (location + nr_bytes > h.data->size()) {
+	auto &bytes = h.Bytes();
+	if (location + nr_bytes > bytes.size()) {
 		throw IOException("OpenzlFileSystem: attempted to read past the end of decompressed archive \"%s\"",
 		                  handle.GetPath());
 	}
-	memcpy(buffer, h.data->data() + location, static_cast<size_t>(nr_bytes));
+	memcpy(buffer, bytes.data() + location, static_cast<size_t>(nr_bytes));
 }
 
 int64_t OpenzlFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	auto &h = handle.Cast<OpenzlFileHandle>();
-	idx_t remaining = h.data->size() > h.position ? h.data->size() - h.position : 0;
+	auto &bytes = h.Bytes();
+	idx_t remaining = bytes.size() > h.position ? bytes.size() - h.position : 0;
 	idx_t to_read = std::min<idx_t>(remaining, static_cast<idx_t>(nr_bytes));
 	if (to_read > 0) {
-		memcpy(buffer, h.data->data() + h.position, to_read);
+		memcpy(buffer, bytes.data() + h.position, to_read);
 		h.position += to_read;
 	}
 	return static_cast<int64_t>(to_read);
 }
 
+void OpenzlFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
+	auto &h = handle.Cast<OpenzlFileHandle>();
+	if (!h.write_buffer) {
+		throw IOException("OpenzlFileSystem: \"%s\" was not opened for writing", handle.GetPath());
+	}
+	if (location + nr_bytes > h.write_buffer->size()) {
+		h.write_buffer->resize(location + static_cast<idx_t>(nr_bytes));
+	}
+	memcpy(&(*h.write_buffer)[location], buffer, static_cast<size_t>(nr_bytes));
+}
+
+int64_t OpenzlFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes) {
+	auto &h = handle.Cast<OpenzlFileHandle>();
+	Write(handle, buffer, nr_bytes, h.position);
+	h.position += static_cast<idx_t>(nr_bytes);
+	return nr_bytes;
+}
+
+void OpenzlFileSystem::Truncate(FileHandle &handle, int64_t new_size) {
+	auto &h = handle.Cast<OpenzlFileHandle>();
+	if (!h.write_buffer) {
+		throw IOException("OpenzlFileSystem: \"%s\" was not opened for writing", handle.GetPath());
+	}
+	h.write_buffer->resize(static_cast<size_t>(new_size));
+}
+
+namespace {
+FileSystem &LocalFs() {
+	static auto fs = FileSystem::CreateLocal();
+	return *fs;
+}
+} // namespace
+
+void OpenzlFileSystem::CreateDirectory(const string &directory, optional_ptr<FileOpener> opener) {
+	LocalFs().CreateDirectory(StripScheme(directory), opener);
+}
+
+bool OpenzlFileSystem::DirectoryExists(const string &directory, optional_ptr<FileOpener> opener) {
+	return CanHandleFile(directory) && LocalFs().DirectoryExists(StripScheme(directory), opener);
+}
+
+void OpenzlFileSystem::RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener) {
+	LocalFs().RemoveDirectory(StripScheme(directory), opener);
+}
+
+void OpenzlFileSystem::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
+	LocalFs().MoveFile(CanHandleFile(source) ? StripScheme(source) : source,
+	                   CanHandleFile(target) ? StripScheme(target) : target, opener);
+}
+
 int64_t OpenzlFileSystem::GetFileSize(FileHandle &handle) {
-	return static_cast<int64_t>(handle.Cast<OpenzlFileHandle>().data->size());
+	return static_cast<int64_t>(handle.Cast<OpenzlFileHandle>().Bytes().size());
 }
 
 timestamp_t OpenzlFileSystem::GetLastModifiedTime(FileHandle &handle) {
@@ -183,8 +301,28 @@ bool OpenzlFileSystem::FileExists(const string &filename, optional_ptr<FileOpene
 	string archive_path = StripScheme(filename);
 	idx_t chunk = 0;
 	SplitChunkSuffix(StripScheme(filename), archive_path, chunk);
-	std::ifstream f(archive_path, std::ios::binary);
-	return f.good();
+	// A directory also opens fine as an ifstream on Linux, so check for a regular file explicitly.
+	return LocalFs().FileExists(archive_path, opener);
+}
+
+bool OpenzlFileSystem::TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
+	if (!CanHandleFile(filename)) {
+		return false;
+	}
+	string archive_path = StripScheme(filename);
+	idx_t chunk = 0;
+	if (SplitChunkSuffix(archive_path, archive_path, chunk)) {
+		throw IOException("OpenzlFileSystem: cannot remove \"%s\": it is one chunk of a multi-chunk archive; remove the "
+		                  "whole archive instead",
+		                  filename);
+	}
+	return std::remove(archive_path.c_str()) == 0;
+}
+
+void OpenzlFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
+	if (!TryRemoveFile(filename, opener)) {
+		throw IOException("OpenzlFileSystem: could not remove \"%s\"", filename);
+	}
 }
 
 vector<OpenFileInfo> OpenzlFileSystem::Glob(const string &path, FileOpener *opener) {

@@ -567,6 +567,32 @@ frame); `openzl_compress()` / `openzl_decompress()` operate on a single
 parquet file and don't chunk -- `openzl_decompress` on a chunked archive
 errors and points to `read_openzl` instead.
 
+## Storing a DuckLake as OpenZL archives
+
+[DuckLake](https://ducklake.select) only writes Parquet, but its data files are opened through DuckDB's filesystem layer,
+so `openzl://` paths work there. Two routes, both measured on a 30M-row BBO slice with `fixed_width` promoted types
+(zstd-19 parquet 299MB, parquet V2 + zstd-19 282MB):
+
+- **Route A -- repack afterwards** (`scripts/ducklake_pack.py --meta <catalog.ducklake>`): rewrites each parquet data file as
+  canonical parquet (keeping the parquet `field_id`s and the row order DuckLake's row ids and delete files depend on),
+  OpenZL-compresses it, verifies the rows are identical, repoints the catalog row (`path`, `file_size_bytes`, `footer_size`)
+  and deletes the original. Works with any DuckLake. 256MB on the slice. Compaction (`merge_adjacent_files`) writes plain
+  parquet again, so re-run it afterwards.
+- **Route B -- DuckLake writes into archives directly**: `ATTACH 'ducklake:...' (DATA_PATH 'openzl://<dir>/')`. The
+  `openzl://` filesystem is writable: a file opened for writing is buffered and OpenZL-compressed when it is closed
+  (temp file + rename), and directories, `MoveFile` and `RemoveFile` are supported, so merge, expire and cleanup all work
+  and merged output stays OpenZL. 255MB on the slice. It needs DuckLake to write *canonical* parquet (uncompressed, no
+  dictionary pages), and stock DuckLake has no dictionary option:
+  `patches/ducklake-parquet-dictionary-size-limit.patch` adds `parquet_dictionary_size_limit` (against DuckLake `main`,
+  bbf5b67). Then `CALL lk.set_option('parquet_compression', 'uncompressed')`,
+  `CALL lk.set_option('parquet_dictionary_size_limit', 0)` and `SET openzl_max_compress_bytes` above the file size
+  (DuckLake files run up to ~540MB). Small files that are not canonical parquet (DuckLake's delete files, up to 64MB) fall
+  back to the generic graph instead of failing; a larger non-canonical file is an error. With `SET openzl_profile =
+  'serial'` any bytes are accepted (unpatched DuckLake works, but compresses much worse than zstd: 475MB on the slice).
+
+Every reader of such a DuckLake needs this extension loaded, and DuckLake itself only supports Parquet officially
+(duckdb/ducklake#1289). `COPY ... (FORMAT OPENZL)` also passes `FIELD_IDS` through to the parquet writer.
+
 ## Deliberately not yet implemented
 
 - **A Postgres extension** reusing `openzl_bridge.{hpp,cpp}` as-is.

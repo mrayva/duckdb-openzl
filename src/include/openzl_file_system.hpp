@@ -18,21 +18,43 @@
 
 #include "duckdb/common/file_system.hpp"
 
+#include "openzl_bridge.hpp"
+
 namespace duckdb {
+
+// How a file opened for WRITING through openzl:// is compressed when it is closed (taken from the openzl_* settings when
+// the file is opened).
+struct OpenzlWriteSettings {
+	int compression_level = 9;
+	size_t max_compress_bytes = openzl_bridge::kDefaultMaxCompressBytes;
+	openzl_bridge::GraphOptions graph;
+};
 
 class OpenzlFileHandle : public FileHandle {
 public:
 	OpenzlFileHandle(FileSystem &file_system, string path, FileOpenFlags flags,
 	                 std::shared_ptr<const string> decompressed_bytes);
 
-	void Close() override {
-	}
+	// Read handles: nothing to do. Write handles: OpenZL-compresses everything written and moves the archive into place
+	// (see OpenzlFileSystem::OpenFile). Throws if the bytes can't be compressed (e.g. non-canonical parquet).
+	void Close() override;
 
 	// Shared with every other open handle on the same archive (see
 	// OpenzlFileSystem::OpenFile): DuckDB opens one handle per scan thread,
 	// and a private copy per handle multiplied RAM by the thread count.
 	std::shared_ptr<const string> data;
 	idx_t position = 0;
+
+	// Write mode only (null for read handles): the file's uncompressed bytes so far, the archive's real path, and how to
+	// compress them on Close().
+	std::shared_ptr<string> write_buffer;
+	string real_path;
+	OpenzlWriteSettings write_settings;
+	bool closed = false;
+
+	const string &Bytes() const {
+		return write_buffer ? *write_buffer : *data;
+	}
 };
 
 class OpenzlFileSystem : public FileSystem {
@@ -48,6 +70,18 @@ public:
 
 	void Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Read(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
+	// Writing: a file opened for writing is buffered in memory and OpenZL-compressed on Close() (so DuckLake, COPY ... TO
+	// 'openzl://...' etc. can write straight into archives). The bytes must be canonical parquet unless the
+	// openzl_profile setting is 'serial'.
+	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
+	int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
+	void Truncate(FileHandle &handle, int64_t new_size) override;
+	void FileSync(FileHandle &handle) override {
+	}
+	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
+	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
+	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
+	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
 
 	int64_t GetFileSize(FileHandle &handle) override;
 	// The buffer is decompressed fresh whenever no handle is holding one, so
@@ -70,6 +104,10 @@ public:
 	}
 
 	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
+	// Deletes the archive file (DuckLake's cleanup_old_files / expire_snapshots delete data files through the
+	// filesystem that owns their path). A "<archive>#chunk=N" path names only part of a file, so it can't be removed.
+	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
+	bool TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override;
 
 	// Strips the "openzl://" prefix to recover the real path to the .zl

@@ -773,7 +773,8 @@ static unique_ptr<FunctionData> OpenzlCopyBind(ClientContext &context, CopyFunct
 	parquet_info.format = "parquet";
 	// Row-group size shapes how large a chunk can overshoot its target and how
 	// much the parquet writer buffers; pass the user's choice straight through.
-	for (const char *opt : {"row_group_size", "row_group_size_bytes"}) {
+	// FIELD_IDS keeps the parquet column ids (DuckLake identifies columns by them when repacking its data files).
+	for (const char *opt : {"row_group_size", "row_group_size_bytes", "field_ids"}) {
 		auto rg_it = input.info.options.find(opt);
 		if (rg_it != input.info.options.end() && !rg_it->second.empty()) {
 			parquet_info.options[opt] = rg_it->second;

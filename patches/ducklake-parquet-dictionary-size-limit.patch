@@ -1,0 +1,40 @@
+diff --git a/src/common/ducklake_util.cpp b/src/common/ducklake_util.cpp
+index a0bf9e11..124b92b8 100644
+--- a/src/common/ducklake_util.cpp
++++ b/src/common/ducklake_util.cpp
+@@ -815,6 +815,7 @@ static const unordered_map<string, config_option_parser_t> &ConfigOptionParsers(
+ 	    {"parquet_compression_level", ParseUnsignedInteger},
+ 	    {"data_inlining_row_limit", ParseUnsignedInteger},
+ 	    {"parquet_row_group_size", ParseRowGroupSize},
++	    {"parquet_dictionary_size_limit", ParseUnsignedInteger},
+ 	    {"parquet_row_group_size_bytes", ParseRowGroupSizeBytes},
+ 	    {"target_file_size", ParseMemorySize},
+ 	    {"require_commit_message", ParseBooleanLiteral},
+diff --git a/src/functions/ducklake_options.cpp b/src/functions/ducklake_options.cpp
+index 6bbc28b1..60030352 100644
+--- a/src/functions/ducklake_options.cpp
++++ b/src/functions/ducklake_options.cpp
+@@ -19,6 +19,7 @@ static constexpr DuckLakeOptionMetadata DUCKLAKE_OPTIONS[] = {
+     {"parquet_version", "Parquet format version (1 or 2)"},
+     {"parquet_compression_level", "Compression level for Parquet files"},
+     {"parquet_row_group_size", "Number of rows per row group in Parquet files"},
++    {"parquet_dictionary_size_limit", "Maximum dictionary size per column chunk in Parquet files (0 disables dictionary encoding)"},
+     {"parquet_row_group_size_bytes", "Number of bytes per row group in Parquet files"},
+     {"hive_file_pattern", "If partitioned data should be written in a hive-like folder structure"},
+     {"target_file_size", "The target data file size for insertion and compaction operations"},
+diff --git a/src/storage/ducklake_insert.cpp b/src/storage/ducklake_insert.cpp
+index 8d90c33d..cc01aa48 100644
+--- a/src/storage/ducklake_insert.cpp
++++ b/src/storage/ducklake_insert.cpp
+@@ -552,6 +552,11 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
+ 	                               &copy_input.table_options)) {
+ 		info->options["compression_level"].emplace_back(parquet_compression_level);
+ 	}
++	string dictionary_size_limit;
++	if (catalog.TryGetConfigOption("parquet_dictionary_size_limit", dictionary_size_limit, schema_id, table_id,
++	                               &copy_input.table_options)) {
++		info->options["dictionary_size_limit"].emplace_back(dictionary_size_limit);
++	}
+ 	string row_group_size;
+ 	if (catalog.TryGetConfigOption("parquet_row_group_size", row_group_size, schema_id, table_id,
+ 	                               &copy_input.table_options)) {
