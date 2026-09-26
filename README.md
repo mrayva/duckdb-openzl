@@ -433,6 +433,24 @@ separate from `openzl_chunk_size_bytes` above, which splits a *table* into indep
 splits one parquet file's data inside a single frame. A trained compressor carries the chunk size it was
 trained with (pass `parquet_chunk_bytes` to `openzl_train`).
 
+### Trained compressors that don't fit every chunk: `PERMISSIVE` and `FALLBACK_TO_GENERIC`
+
+A trained compressor (especially one from the fuller ACE search, `no_ace_successors := false`) can contain stages with
+strict data-dependent preconditions -- e.g. OpenZL's `bitunpack` requires its input to be *exactly* a bit-packed array.
+OpenZL's default is **strict** mode: one stage rejecting one chunk aborts the whole compression. On real data this hit
+163 of 21,483 mirror tables even though the same compressors had scored -13% and -3% on held-out samples; on a
+30.7M-row table only 1 of 14 chunks tripped it, and strict mode discarded the gain on all 14.
+
+| SET (default) | COPY option | Meaning |
+|---|---|---|
+| `openzl_permissive_compression` (false) | `PERMISSIVE` | OpenZL's permissive mode: a stage that rejects its input falls back to generic compression for **that stream only**; every other stream keeps the trained graph. Output is byte-identical to strict mode wherever strict mode succeeds. |
+| -- | `FALLBACK_TO_GENERIC` | If the trained compressor still fails on a chunk (e.g. a corrupt compressor file), compress that chunk with the generic graph instead of failing the COPY. Chunks are independent frames, so mixing is valid. |
+
+`SELECT openzl_fallback_chunks()` returns the process-wide count of chunks that fell back; read it before and after a COPY
+to see how many of its chunks did. On the failing table above: generic 383.6MB, trained+strict *failed*,
+trained+`PERMISSIVE` **332.1MB (-13.4%, 0 chunks fell back)**, trained+`FALLBACK_TO_GENERIC` only 335.3MB (1 of 14 chunks fell
+back). Use `PERMISSIVE` with any trained compressor; keep `FALLBACK_TO_GENERIC` as the safety net.
+
 What a format version supports depends on the codecs the graph picks for your data: a small table works down to
 version 10, while the serial profile needs roughly 24+. Too old a version fails with an error that says so, not
 with corrupt output.

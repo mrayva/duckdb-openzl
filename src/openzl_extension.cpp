@@ -14,6 +14,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <fstream>
 
@@ -59,6 +60,9 @@ static openzl_bridge::GraphOptions OpenzlDefaultGraphOptions(ClientContext &cont
 	}
 	if (context.TryGetCurrentSetting("openzl_profile", v) && !v.IsNull()) {
 		g.profile = v.ToString();
+	}
+	if (context.TryGetCurrentSetting("openzl_permissive_compression", v) && !v.IsNull()) {
+		g.permissive = v.GetValue<bool>();
 	}
 	if (context.TryGetCurrentSetting("openzl_parquet_chunk_bytes", v) && !v.IsNull()) {
 		auto bytes = v.GetValue<int64_t>();
@@ -587,6 +591,15 @@ static TableFunction GetOpenzlPromoteFunction() {
 	return function;
 }
 
+// Process-wide count of chunks that fell back from a trained compressor to the generic graph (COPY option
+// FALLBACK_TO_GENERIC). Cumulative; read the difference around a COPY to see how many chunks of it fell back.
+static std::atomic<int64_t> g_fallback_chunks {0};
+
+inline void OpenzlFallbackChunksFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::GetData<int64_t>(result)[0] = g_fallback_chunks.load();
+}
+
 // COPY tbl TO 'data.zl' (FORMAT OPENZL)
 //
 // Delegates entirely to the catalog's registered "parquet" CopyFunction to do
@@ -619,6 +632,10 @@ struct OpenzlCopyBindData : public FunctionData {
 	size_t chunk_size_bytes = 0;
 	size_t max_compress_bytes = openzl_bridge::kDefaultMaxCompressBytes;
 	openzl_bridge::GraphOptions graph;
+	// If the trained compressor fails on a chunk (even in permissive mode), compress that chunk with the generic graph
+	// instead of failing the COPY. Chunks are independent frames, so mixing is valid. Counted in
+	// openzl_fallback_chunks().
+	bool fallback_to_generic = false;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<OpenzlCopyBindData>();
@@ -630,6 +647,7 @@ struct OpenzlCopyBindData : public FunctionData {
 		result->chunk_size_bytes = chunk_size_bytes;
 		result->max_compress_bytes = max_compress_bytes;
 		result->graph = graph;
+		result->fallback_to_generic = fallback_to_generic;
 		return std::move(result);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -639,7 +657,8 @@ struct OpenzlCopyBindData : public FunctionData {
 		       compression_level == other.compression_level && in_memory == other.in_memory &&
 		       chunk_size_bytes == other.chunk_size_bytes && max_compress_bytes == other.max_compress_bytes &&
 		       graph.format_version == other.graph.format_version && graph.profile == other.graph.profile &&
-		       graph.parquet_chunk_bytes == other.graph.parquet_chunk_bytes;
+		       graph.parquet_chunk_bytes == other.graph.parquet_chunk_bytes &&
+		       graph.permissive == other.graph.permissive && fallback_to_generic == other.fallback_to_generic;
 	}
 };
 
@@ -722,6 +741,14 @@ static unique_ptr<FunctionData> OpenzlCopyBind(ClientContext &context, CopyFunct
 	if (profile_it != input.info.options.end() && !profile_it->second.empty()) {
 		result->graph.profile = profile_it->second[0].ToString();
 	}
+	auto perm_it = input.info.options.find("permissive");
+	if (perm_it != input.info.options.end() && !perm_it->second.empty()) {
+		result->graph.permissive = perm_it->second[0].GetValue<bool>();
+	}
+	auto fb_it = input.info.options.find("fallback_to_generic");
+	if (fb_it != input.info.options.end() && !fb_it->second.empty()) {
+		result->fallback_to_generic = fb_it->second[0].GetValue<bool>();
+	}
 	auto pchunk_it = input.info.options.find("parquet_chunk_size_bytes");
 	if (pchunk_it != input.info.options.end() && !pchunk_it->second.empty()) {
 		auto v = pchunk_it->second[0].GetValue<int64_t>();
@@ -761,6 +788,22 @@ static void OpenzlStartChunk(ClientContext &context, OpenzlCopyBindData &bind_da
 	gstate.current_chunk_open = true;
 }
 
+// Compresses one staged chunk; with FALLBACK_TO_GENERIC a failing trained compressor is retried with the generic graph.
+static std::string CompressChunkWithFallback(const OpenzlCopyBindData &bind_data, const std::string &canonical_bytes) {
+	try {
+		return openzl_bridge::CompressParquetBytesToString(canonical_bytes, bind_data.trained_compressor_path,
+		                                                   bind_data.compression_level, bind_data.max_compress_bytes,
+		                                                   bind_data.graph);
+	} catch (const openzl_bridge::Error &) {
+		if (!bind_data.fallback_to_generic || bind_data.trained_compressor_path.empty()) {
+			throw;
+		}
+	}
+	g_fallback_chunks++;
+	return openzl_bridge::CompressParquetBytesToString(canonical_bytes, "", bind_data.compression_level,
+	                                                   bind_data.max_compress_bytes, bind_data.graph);
+}
+
 // Finishes the current chunk's parquet file, OpenZL-compresses it and appends
 // the frame to the archive; removes the staging file/buffer either way.
 static void OpenzlEndChunk(ClientContext &context, OpenzlCopyBindData &bind_data, OpenzlCopyGlobalState &gstate) {
@@ -773,9 +816,7 @@ static void OpenzlEndChunk(ClientContext &context, OpenzlCopyBindData &bind_data
 		if (bind_data.in_memory) {
 			// TakeBuffer() removes the entry regardless of what happens next.
 			std::string canonical_bytes = OpenzlBufferFileSystem::TakeBuffer(gstate.tmp_parquet_path);
-			frame = openzl_bridge::CompressParquetBytesToString(canonical_bytes, bind_data.trained_compressor_path,
-			                                                    bind_data.compression_level,
-			                                                    bind_data.max_compress_bytes, bind_data.graph);
+			frame = CompressChunkWithFallback(bind_data, canonical_bytes);
 		} else {
 			// Read the staged file, refusing an oversized one before allocating.
 			std::string canonical_bytes;
@@ -796,9 +837,7 @@ static void OpenzlEndChunk(ClientContext &context, OpenzlCopyBindData &bind_data
 				f.seekg(0);
 				f.read(&canonical_bytes[0], static_cast<std::streamsize>(size));
 			}
-			frame = openzl_bridge::CompressParquetBytesToString(canonical_bytes, bind_data.trained_compressor_path,
-			                                                    bind_data.compression_level,
-			                                                    bind_data.max_compress_bytes, bind_data.graph);
+			frame = CompressChunkWithFallback(bind_data, canonical_bytes);
 		}
 	} catch (const openzl_bridge::Error &e) {
 		if (!bind_data.in_memory) {
@@ -968,6 +1007,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Compression graph: 'parquet' (default, parquet-aware, canonical parquet only) or "
 	                          "'serial' (generic bytes, a baseline for what the parquet graph buys).",
 	                          LogicalType::VARCHAR, Value("parquet"));
+	config.AddExtensionOption(
+	    "openzl_permissive_compression",
+	    "Permissive mode: when one stage of a (trained) graph rejects its input, only that stage falls "
+	    "back to generic compression instead of the whole compression failing. Default false (strict).",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	loader.RegisterFunction(ScalarFunction("openzl_fallback_chunks", {}, LogicalType::BIGINT, OpenzlFallbackChunksFun));
 	config.AddExtensionOption("openzl_parquet_chunk_bytes",
 	                          "Parquet profile: split the input into independently compressed chunks of about this "
 	                          "many bytes inside each frame. -1 (default) = auto: 20000000 when the format version "

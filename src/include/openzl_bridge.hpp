@@ -72,6 +72,11 @@ struct GraphOptions {
 	// 0 = never; any other value is explicit and needs format version >= 21. A
 	// trained compressor carries the value it was trained with instead.
 	size_t parquet_chunk_bytes = kAutoParquetChunkBytes;
+	// OpenZL's permissive compression mode (CParam::PermissiveCompression): when a stage of the graph rejects its input
+	// (e.g. a trained graph's bit-unpack step whose exact-size assumption doesn't hold for some chunk), only that stage
+	// falls back to generic compression instead of the whole compress call failing. Costs a little efficiency on such
+	// streams. Default off (strict), which is OpenZL's own default.
+	bool permissive = false;
 };
 
 // The chunk size actually used for `g` (resolves the auto sentinel).

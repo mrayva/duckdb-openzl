@@ -720,3 +720,75 @@ query I
 SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_v20_auto.zl');
 ----
 1000
+
+# ---- PERMISSIVE / FALLBACK_TO_GENERIC (trained compressors that don't fit every chunk) ----
+
+# Permissive mode only changes what happens when a stage rejects its input; on data the graph handles it must produce
+# byte-identical output to strict mode.
+statement ok
+COPY t TO '__TEST_DIR__/openzl_perm_off.zl' (FORMAT OPENZL, TRAINED_COMPRESSOR '__TEST_DIR__/openzl_trained.compressor');
+
+statement ok
+COPY t TO '__TEST_DIR__/openzl_perm_on.zl' (FORMAT OPENZL, TRAINED_COMPRESSOR '__TEST_DIR__/openzl_trained.compressor', PERMISSIVE true);
+
+query I
+SELECT (SELECT content FROM read_blob('__TEST_DIR__/openzl_perm_off.zl')) =
+       (SELECT content FROM read_blob('__TEST_DIR__/openzl_perm_on.zl'));
+----
+true
+
+statement ok
+SET openzl_permissive_compression = true;
+
+statement ok
+COPY t TO '__TEST_DIR__/openzl_perm_setting.zl' (FORMAT OPENZL);
+
+statement ok
+RESET openzl_permissive_compression;
+
+query I
+SELECT count(*) FROM read_openzl('__TEST_DIR__/openzl_perm_setting.zl');
+----
+1000
+
+# A trained compressor that fails (here: a corrupt compressor file, which fails the same way a graph stage that rejects a
+# chunk does) makes a strict COPY fail; FALLBACK_TO_GENERIC compresses the chunk with the generic graph instead, counts it,
+# and the data reads back intact.
+statement ok
+COPY (SELECT 'this is not a serialized compressor') TO '__TEST_DIR__/junk.compressor' (FORMAT CSV, HEADER false);
+
+statement ok
+CREATE TABLE other_shape AS SELECT range AS x, range * 2 AS y, 'v' || range AS z, range % 7 AS w, (range % 3)::DOUBLE AS d FROM range(5000);
+
+statement error
+COPY other_shape TO '__TEST_DIR__/openzl_mismatch.zl' (FORMAT OPENZL, TRAINED_COMPRESSOR '__TEST_DIR__/junk.compressor');
+----
+compress failed
+
+statement ok
+CREATE TEMP TABLE fb_before AS SELECT openzl_fallback_chunks() AS n;
+
+statement ok
+COPY other_shape TO '__TEST_DIR__/openzl_fallback.zl' (FORMAT OPENZL, TRAINED_COMPRESSOR '__TEST_DIR__/junk.compressor', FALLBACK_TO_GENERIC true);
+
+query I
+SELECT openzl_fallback_chunks() - (SELECT n FROM fb_before);
+----
+1
+
+query II
+SELECT count(*), sum(x) FROM read_openzl('__TEST_DIR__/openzl_fallback.zl');
+----
+5000	12497500
+
+# Without a trained compressor there is nothing to fall back from: a real failure (here the size guard) still surfaces.
+statement ok
+SET openzl_max_compress_bytes = 100;
+
+statement error
+COPY other_shape TO '__TEST_DIR__/openzl_nofb.zl' (FORMAT OPENZL, FALLBACK_TO_GENERIC true);
+----
+too large
+
+statement ok
+RESET openzl_max_compress_bytes;
