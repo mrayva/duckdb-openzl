@@ -808,3 +808,67 @@ too large
 
 statement ok
 RESET openzl_max_compress_bytes;
+
+# ---- openzl_promote(fixed_width := true) and openzl_restore ----
+
+statement ok
+CREATE TABLE fw_txt AS SELECT * FROM (VALUES
+    ('093000123456789', '1', '000', 'AAPL',  NULL::VARCHAR, '007', '12'),
+    ('155240841375475', '2', '007', 'MSFT',  NULL,          '7',   '34'),
+    ('040000000000000', '3', '120', 'GOOG',  NULL,          '12',  '56')
+) t(ts, id, code, s, n, mixed, plain2);
+
+# Without the option, zero-padded columns stay text (a leading zero can't survive a BIGINT).
+query IIIII
+SELECT typeof(ts), typeof(code), typeof(id), typeof(mixed), typeof(plain2) FROM openzl_promote('fw_txt') LIMIT 1;
+----
+VARCHAR	VARCHAR	BIGINT	VARCHAR	BIGINT
+
+# With it, all-digit same-length columns with leading zeros become DECIMAL(L,0); the rest is unchanged
+# (mixed lengths stay text, exact integers stay BIGINT).
+query IIIIII
+SELECT typeof(ts), typeof(code), typeof(id), typeof(s), typeof(mixed), typeof(plain2)
+FROM openzl_promote('fw_txt', fixed_width := true) LIMIT 1;
+----
+DECIMAL(15,0)	DECIMAL(3,0)	BIGINT	VARCHAR	VARCHAR	BIGINT
+
+# Through an archive and back: openzl_restore rebuilds the original zero-padded text exactly.
+statement ok
+COPY (SELECT * FROM openzl_promote('fw_txt', fixed_width := true)) TO '__TEST_DIR__/openzl_fw.zl' (FORMAT OPENZL);
+
+# Stored as numbers (no leading zeros)...
+query III
+SELECT typeof(ts), ts, code FROM read_openzl('__TEST_DIR__/openzl_fw.zl') ORDER BY id;
+----
+DECIMAL(15,0)	93000123456789	0
+DECIMAL(15,0)	155240841375475	7
+DECIMAL(15,0)	40000000000000	120
+
+# ...and restored exactly to the original text.
+query II
+SELECT typeof(ts), typeof(code) FROM openzl_restore('__TEST_DIR__/openzl_fw.zl') LIMIT 1;
+----
+VARCHAR	VARCHAR
+
+query I
+SELECT count(*) FROM (
+    SELECT ts, id, code, s, n, mixed FROM fw_txt
+    EXCEPT ALL
+    SELECT ts, id::VARCHAR, code, s, n, mixed FROM openzl_restore('__TEST_DIR__/openzl_fw.zl')
+);
+----
+0
+
+# Only 2..18-digit widths are promoted: a 19-digit code stays text; NULLs pass through.
+statement ok
+CREATE TABLE fw_edge AS SELECT * FROM (VALUES ('0123456789012345678', NULL::VARCHAR, '01'), ('0000000000000000001', '5', NULL)) t(wide19, sparse, two);
+
+query II
+SELECT typeof(wide19), typeof(sparse) FROM openzl_promote('fw_edge', fixed_width := true) LIMIT 1;
+----
+VARCHAR	BIGINT
+
+query I
+SELECT count(*) FROM openzl_promote('fw_edge', fixed_width := true) WHERE two IS NULL OR two = 1;
+----
+2

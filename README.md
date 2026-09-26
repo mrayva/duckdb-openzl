@@ -482,6 +482,33 @@ non-VARCHAR columns -- passes through unchanged.
 | `decimal_int_digits` | 12 | Integer-part digits allowed in the decimal form. |
 | `decimal_scale` | 6 | Fractional digits allowed; the type is `DECIMAL(decimal_int_digits + decimal_scale, decimal_scale)`, at most 18 total. |
 | `promote_decimal` | `true` | `false` = only ever promote to `BIGINT`. |
+| `fixed_width` | `false` | Also promote all-digit, same-length columns with leading zeros to `DECIMAL(L,0)` (see below); reverse with `openzl_restore`. |
+
+### Zero-padded digit columns: `fixed_width := true` and `openzl_restore`
+
+Some columns are digit strings of one fixed length that *start with zeros*, such as TAQ timestamps `HHMMSSnnnnnnnnn`
+(`093000123456789` = 09:30:00.123456789). Under the strict rule above they can't be `BIGINT` (the leading zero would be lost),
+so they stay text -- and as text OpenZL compresses them far worse than zstd (about 46-49% worse on a 5M-row BBO slice), because
+it cannot use its numeric codecs on nearly-sorted timestamps.
+
+```sql
+COPY (SELECT * FROM openzl_promote('tbl', fixed_width := true)) TO 'tbl.zl' (FORMAT OPENZL);
+SELECT * FROM openzl_restore('tbl.zl');   -- the DECIMAL(L,0) columns come back as the original zero-padded text
+```
+
+With `fixed_width := true`, a VARCHAR column whose non-null values are all digits of the *same length* L (2 <= L <= 18) but
+which isn't already a lossless `BIGINT` becomes `DECIMAL(L,0)`. Parquet stores that as a plain 64-bit integer -- the same
+stream as `BIGINT`, which is what compresses well -- and **the precision L is the width**, so the archive is self-describing
+and no side metadata is needed. `openzl_restore(path)` reads an archive and turns every `DECIMAL(L,0)` column back into
+`lpad(CAST(c AS VARCHAR), L, '0')`. Use it only on data written with `fixed_width`: a genuine `DECIMAL(L,0)` column would be
+padded too. Columns with mixed lengths, non-digits or more than 18 digits stay text; NULLs pass through; exact integers still
+become `BIGINT`. Off by default.
+
+Measured on a 5M-row slice of a BBO table (23 columns; `Time` and `Participant_Timestamp` are 15-digit zero-padded strings):
+OpenZL 64.3MB (text) -> **45.5MB** (`fixed_width`), against zstd-19 parquet 52.5MB: from 22.5% worse to **13.4% better**.
+`DECIMAL(15,0)` compresses within 0.02% of `BIGINT`. Restoring is exact: 5,000,000 rows, 0 multiset mismatches, 0 row-order
+mismatches, including the 753,784 rows that start with `0`. On a 100-table stratified sample of the NYSE mirror generic OpenZL
+went from +1.9% to **-5.8%** versus zstd-19 parquet (23 tables changed, none got larger).
 
 The table is read through a second connection (committed data only) and the
 scan is single-threaded. Narrower integer widths (`TINYINT`, `INTEGER`, ...)

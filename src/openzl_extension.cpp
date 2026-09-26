@@ -462,6 +462,11 @@ static unique_ptr<FunctionData> OpenzlPromoteBind(ClientContext &context, TableF
 	int64_t dec_int_digits = GetNamedBigint(input, "decimal_int_digits", 12);
 	int64_t dec_scale = GetNamedBigint(input, "decimal_scale", 6);
 	bool promote_decimal = GetNamedBool(input, "promote_decimal", true);
+	// fixed_width: an all-digit column whose values all have the SAME length (zero-padded codes such as HHMMSSnnnnnnnnn
+	// timestamps) but which can't be a BIGINT because some values start with '0' becomes DECIMAL(L,0), L = that length.
+	// Parquet stores it as a plain 64-bit integer (which is what compresses well), and the precision L IS the width, so
+	// the change is reversible with openzl_restore(). Opt-in.
+	bool fixed_width = GetNamedBool(input, "fixed_width", false);
 	if (max_int_digits < 1 || max_int_digits > 18) {
 		throw BinderException("openzl_promote: max_int_digits must be between 1 and 18");
 	}
@@ -500,6 +505,10 @@ static unique_ptr<FunctionData> OpenzlPromoteBind(ClientContext &context, TableF
 		}
 		aggs += "count(" + c + "), bool_and(" + c + " IS NULL OR regexp_full_match(" + c + ", '" + int_re + "')), " +
 		        "bool_and(" + c + " IS NULL OR regexp_full_match(" + c + ", '" + dec_re + "'))";
+		if (fixed_width) {
+			aggs += ", bool_and(" + c + " IS NULL OR regexp_full_match(" + c + ", '[0-9]+')), min(length(" + c +
+			        ")), max(length(" + c + "))";
+		}
 		agg_col.push_back(i);
 	}
 
@@ -510,16 +519,31 @@ static unique_ptr<FunctionData> OpenzlPromoteBind(ClientContext &context, TableF
 		if (stats->HasError()) {
 			throw IOException("openzl_promote: analysis of '%s' failed: %s", table, stats->GetError());
 		}
+		const idx_t stride = fixed_width ? 6 : 3;
 		for (idx_t k = 0; k < agg_col.size(); k++) {
 			idx_t i = agg_col[k];
-			auto nonnull = stats->GetValue(3 * k, 0);
+			auto nonnull = stats->GetValue(stride * k, 0);
 			if (nonnull.IsNull() || nonnull.GetValue<int64_t>() == 0) {
 				continue;
 			}
-			auto all_int = stats->GetValue(3 * k + 1, 0);
-			auto all_dec = stats->GetValue(3 * k + 2, 0);
+			auto all_int = stats->GetValue(stride * k + 1, 0);
+			auto all_dec = stats->GetValue(stride * k + 2, 0);
+			bool digits_fixed = false;
+			int64_t width = 0;
+			if (fixed_width) {
+				auto all_digits = stats->GetValue(stride * k + 3, 0);
+				auto min_len = stats->GetValue(stride * k + 4, 0);
+				auto max_len = stats->GetValue(stride * k + 5, 0);
+				if (!all_digits.IsNull() && all_digits.GetValue<bool>() && !min_len.IsNull() && !max_len.IsNull() &&
+				    min_len.GetValue<int64_t>() == max_len.GetValue<int64_t>()) {
+					width = min_len.GetValue<int64_t>();
+					digits_fixed = width >= 2 && width <= 18;
+				}
+			}
 			if (!all_int.IsNull() && all_int.GetValue<bool>()) {
 				verdict[i] = "BIGINT";
+			} else if (digits_fixed) {
+				verdict[i] = "DECIMAL(" + std::to_string(width) + ",0)";
 			} else if (promote_decimal && !all_dec.IsNull() && all_dec.GetValue<bool>()) {
 				verdict[i] = dec_type;
 			}
@@ -588,7 +612,61 @@ static TableFunction GetOpenzlPromoteFunction() {
 	function.named_parameters["decimal_int_digits"] = LogicalType::BIGINT;
 	function.named_parameters["decimal_scale"] = LogicalType::BIGINT;
 	function.named_parameters["promote_decimal"] = LogicalType::BOOLEAN;
+	function.named_parameters["fixed_width"] = LogicalType::BOOLEAN;
 	return function;
+}
+
+// openzl_restore(path) -> table
+//
+// The inverse of openzl_promote(..., fixed_width := true): reads an archive (or any parquet, via read_openzl) and turns
+// every DECIMAL(L,0) column, with 2 <= L <= 18, back into a zero-padded VARCHAR of width L (`lpad(CAST(c AS VARCHAR),
+// L, '0')`), restoring e.g. '093000123456789' from 93000123456789. Other columns pass through unchanged. Only use it on
+// data that was written with fixed_width promotion: a genuine DECIMAL(L,0) column would be padded too.
+static unique_ptr<FunctionData> OpenzlRestoreBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	if (input.inputs[0].IsNull()) {
+		throw BinderException("openzl_restore: path must not be NULL");
+	}
+	string path = StringValue::Get(input.inputs[0]);
+	string source = "read_openzl(" + KeywordHelper::WriteQuoted(path, '\'') + ")";
+	Connection con(DatabaseInstance::GetDatabase(context));
+	auto desc = con.Query("DESCRIBE SELECT * FROM " + source);
+	if (desc->HasError()) {
+		throw IOException("openzl_restore: cannot read '%s': %s", path, desc->GetError());
+	}
+	auto result = make_uniq<OpenzlPromoteBindData>();
+	string select_list;
+	for (idx_t i = 0; i < desc->RowCount(); i++) {
+		string name = desc->GetValue(0, i).ToString();
+		string type = desc->GetValue(1, i).ToString();
+		string c = OpenzlPromoteIdent(name);
+		if (i > 0) {
+			select_list += ", ";
+		}
+		int width = 0;
+		if (type.size() > 11 && type.compare(0, 8, "DECIMAL(") == 0 && type.compare(type.size() - 3, 3, ",0)") == 0) {
+			width = std::atoi(type.substr(8, type.size() - 11).c_str());
+		}
+		if (width >= 2 && width <= 18) {
+			select_list += "lpad(CAST(" + c + " AS VARCHAR), " + std::to_string(width) + ", '0') AS " + c;
+			result->promoted.push_back(name + ":VARCHAR(" + std::to_string(width) + ")");
+		} else {
+			select_list += c;
+		}
+	}
+	result->select_sql = "SELECT " + select_list + " FROM " + source;
+	auto schema = con.Query(result->select_sql + " LIMIT 0");
+	if (schema->HasError()) {
+		throw IOException("openzl_restore: %s", schema->GetError());
+	}
+	return_types = schema->types;
+	names = schema->names;
+	return std::move(result);
+}
+
+static TableFunction GetOpenzlRestoreFunction() {
+	return TableFunction("openzl_restore", {LogicalType::VARCHAR}, OpenzlPromoteFunction, OpenzlRestoreBind,
+	                     OpenzlPromoteInitGlobal);
 }
 
 // Process-wide count of chunks that fell back from a trained compressor to the generic graph (COPY option
@@ -1039,6 +1117,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetOpenzlCopyFunction());
 	loader.RegisterFunction(GetOpenzlTrainFunction());
 	loader.RegisterFunction(GetOpenzlPromoteFunction());
+	loader.RegisterFunction(GetOpenzlRestoreFunction());
 }
 
 void OpenzlExtension::Load(ExtensionLoader &loader) {
