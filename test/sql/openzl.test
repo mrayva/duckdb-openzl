@@ -737,6 +737,22 @@ SELECT (SELECT content FROM read_blob('__TEST_DIR__/openzl_perm_off.zl')) =
 ----
 true
 
+# Default is "auto" (NULL): permissive exactly when a trained compressor is used.
+query I
+SELECT value IS NULL FROM duckdb_settings() WHERE name = 'openzl_permissive_compression';
+----
+true
+
+# Forcing strict on data the trained graph handles gives the same bytes as auto (permissive) mode.
+statement ok
+COPY t TO '__TEST_DIR__/openzl_perm_strict.zl' (FORMAT OPENZL, TRAINED_COMPRESSOR '__TEST_DIR__/openzl_trained.compressor', PERMISSIVE false);
+
+query I
+SELECT (SELECT content FROM read_blob('__TEST_DIR__/openzl_perm_strict.zl')) =
+       (SELECT content FROM read_blob('__TEST_DIR__/openzl_perm_off.zl'));
+----
+true
+
 statement ok
 SET openzl_permissive_compression = true;
 

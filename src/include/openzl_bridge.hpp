@@ -75,8 +75,11 @@ struct GraphOptions {
 	// OpenZL's permissive compression mode (CParam::PermissiveCompression): when a stage of the graph rejects its input
 	// (e.g. a trained graph's bit-unpack step whose exact-size assumption doesn't hold for some chunk), only that stage
 	// falls back to generic compression instead of the whole compress call failing. Costs a little efficiency on such
-	// streams. Default off (strict), which is OpenZL's own default.
-	bool permissive = false;
+	// streams and changes nothing where strict mode succeeds. -1 (default, "auto") = permissive exactly when a trained
+	// compressor is used (matches upstream's `zli`, which runs permissive unless --strict); the generic graph stays
+	// strict so that e.g. a non-canonical parquet input is reported, not silently compressed as opaque bytes. 0 =
+	// strict, 1 = permissive.
+	int permissive = -1;
 };
 
 // The chunk size actually used for `g` (resolves the auto sentinel).

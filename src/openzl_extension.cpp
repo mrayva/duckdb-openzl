@@ -62,7 +62,7 @@ static openzl_bridge::GraphOptions OpenzlDefaultGraphOptions(ClientContext &cont
 		g.profile = v.ToString();
 	}
 	if (context.TryGetCurrentSetting("openzl_permissive_compression", v) && !v.IsNull()) {
-		g.permissive = v.GetValue<bool>();
+		g.permissive = v.GetValue<bool>() ? 1 : 0;
 	}
 	if (context.TryGetCurrentSetting("openzl_parquet_chunk_bytes", v) && !v.IsNull()) {
 		auto bytes = v.GetValue<int64_t>();
@@ -743,7 +743,7 @@ static unique_ptr<FunctionData> OpenzlCopyBind(ClientContext &context, CopyFunct
 	}
 	auto perm_it = input.info.options.find("permissive");
 	if (perm_it != input.info.options.end() && !perm_it->second.empty()) {
-		result->graph.permissive = perm_it->second[0].GetValue<bool>();
+		result->graph.permissive = perm_it->second[0].GetValue<bool>() ? 1 : 0;
 	}
 	auto fb_it = input.info.options.find("fallback_to_generic");
 	if (fb_it != input.info.options.end() && !fb_it->second.empty()) {
@@ -1010,8 +1010,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption(
 	    "openzl_permissive_compression",
 	    "Permissive mode: when one stage of a (trained) graph rejects its input, only that stage falls "
-	    "back to generic compression instead of the whole compression failing. Default false (strict).",
-	    LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	    "back to generic compression instead of the whole compression failing. NULL (default) = auto: permissive "
+	    "when a trained compressor is used, strict for the generic graph; true/false force it.",
+	    LogicalType::BOOLEAN, Value(LogicalType::BOOLEAN));
 	loader.RegisterFunction(ScalarFunction("openzl_fallback_chunks", {}, LogicalType::BIGINT, OpenzlFallbackChunksFun));
 	config.AddExtensionOption("openzl_parquet_chunk_bytes",
 	                          "Parquet profile: split the input into independently compressed chunks of about this "

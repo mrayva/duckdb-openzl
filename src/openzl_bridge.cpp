@@ -314,7 +314,8 @@ std::string CompressBytesImpl(const std::string &input, const std::string &error
 		cctx.setParameter(openzl::CParam::FormatVersion,
 		                  graph.format_version == 0 ? ZL_MAX_FORMAT_VERSION : graph.format_version);
 		cctx.setParameter(openzl::CParam::CompressionLevel, compression_level);
-		if (graph.permissive) {
+		const bool permissive = graph.permissive < 0 ? !compressor_bytes.empty() : graph.permissive != 0;
+		if (permissive) {
 			cctx.setParameter(openzl::CParam::PermissiveCompression, 1); // ZL_TernaryParam_enable
 		}
 		cctx.refCompressor(*compressor);

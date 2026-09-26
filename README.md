@@ -443,13 +443,13 @@ OpenZL's default is **strict** mode: one stage rejecting one chunk aborts the wh
 
 | SET (default) | COPY option | Meaning |
 |---|---|---|
-| `openzl_permissive_compression` (false) | `PERMISSIVE` | OpenZL's permissive mode: a stage that rejects its input falls back to generic compression for **that stream only**; every other stream keeps the trained graph. Output is byte-identical to strict mode wherever strict mode succeeds. |
+| `openzl_permissive_compression` (NULL = auto) | `PERMISSIVE` | OpenZL's permissive mode: a stage that rejects its input falls back to generic compression for **that stream only**; every other stream keeps the trained graph. Output is byte-identical to strict mode wherever strict mode succeeds. **Default is auto: permissive whenever a trained compressor is used** (as in upstream's `zli`, which is permissive unless `--strict`), strict for the generic graph so a non-canonical parquet input is still reported instead of being silently compressed as opaque bytes. `true`/`false` force it. |
 | -- | `FALLBACK_TO_GENERIC` | If the trained compressor still fails on a chunk (e.g. a corrupt compressor file), compress that chunk with the generic graph instead of failing the COPY. Chunks are independent frames, so mixing is valid. |
 
 `SELECT openzl_fallback_chunks()` returns the process-wide count of chunks that fell back; read it before and after a COPY
 to see how many of its chunks did. On the failing table above: generic 383.6MB, trained+strict *failed*,
 trained+`PERMISSIVE` **332.1MB (-13.4%, 0 chunks fell back)**, trained+`FALLBACK_TO_GENERIC` only 335.3MB (1 of 14 chunks fell
-back). Use `PERMISSIVE` with any trained compressor; keep `FALLBACK_TO_GENERIC` as the safety net.
+back). With a trained compressor `PERMISSIVE` now happens automatically; keep `FALLBACK_TO_GENERIC` as the safety net.
 
 What a format version supports depends on the codecs the graph picks for your data: a small table works down to
 version 10, while the serial profile needs roughly 24+. Too old a version fails with an error that says so, not
