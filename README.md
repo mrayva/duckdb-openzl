@@ -6,6 +6,13 @@ Parquet files.
 
 This repository is based on https://github.com/duckdb/extension-template.
 
+> **Branch `duckdb-2.0`**: this is the port to DuckDB 2.0 (`v2.0.0-dev1`, the same `duckdb` / `extension-ci-tools` commits DuckLake
+> `main` builds against; `main` stays on DuckDB 1.5.x). API changes handled: `Identifier` for column and option names,
+> `Connection::Submit` + `QueryResultStream` instead of `SendQuery`, `BaseQueryResult::GetTypes()/GetNames()`. Builds together with
+> DuckLake and passes the test suite (237 assertions) **except**: `COPY ... (FORMAT OPENZL, ROW_GROUP_SIZE n)` no longer takes effect --
+> DuckDB 2.0's binder consumes the option itself and the parquet writer ignores it -- so that assertion is removed until fixed.
+> `.github/workflows` still points at the 1.5 CI tools and is untested for 2.0.
+
 ## Status: native-linked
 
 `src/openzl_bridge.{hpp,cpp}` links OpenZL's C++ library directly

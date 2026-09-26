@@ -6,7 +6,9 @@
 #include "openzl_train_bridge.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
+#include "duckdb/main/query_result_stream.hpp"
 #include "duckdb/catalog/default/default_table_functions.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/copy_function.hpp"
@@ -254,7 +256,7 @@ struct OpenzlTrainBindData : public TableFunctionData {
 };
 
 static Value GetNamedParameter(TableFunctionBindInput &input, const string &name) {
-	auto it = input.named_parameters.find(name);
+	auto it = input.named_parameters.find(Identifier(name));
 	if (it == input.named_parameters.end()) {
 		return Value();
 	}
@@ -291,7 +293,7 @@ static openzl_bridge::ClusteringTrainer ParseClusteringTrainer(const string &val
 }
 
 static unique_ptr<FunctionData> OpenzlTrainBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs[0].IsNull() || input.inputs[0].type().id() != LogicalTypeId::LIST) {
 		throw BinderException(
 		    "openzl_train: first argument must be a list of sample file paths, e.g. ['a.parquet', 'b.parquet']");
@@ -450,7 +452,7 @@ static string OpenzlPromoteIdent(const string &name) {
 }
 
 static unique_ptr<FunctionData> OpenzlPromoteBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("openzl_promote: table name must not be NULL");
 	}
@@ -567,14 +569,14 @@ static unique_ptr<FunctionData> OpenzlPromoteBind(ClientContext &context, TableF
 	if (schema->HasError()) {
 		throw IOException("openzl_promote: %s", schema->GetError());
 	}
-	return_types = schema->types;
-	names = schema->names;
+	return_types = schema->GetTypes();
+	names = schema->GetNames();
 	return std::move(result);
 }
 
 struct OpenzlPromoteGlobalState : public GlobalTableFunctionState {
 	unique_ptr<Connection> con;
-	unique_ptr<QueryResult> result;
+	unique_ptr<QueryResultStream> stream;
 	idx_t MaxThreads() const override {
 		return 1;
 	}
@@ -585,19 +587,17 @@ static unique_ptr<GlobalTableFunctionState> OpenzlPromoteInitGlobal(ClientContex
 	auto &bind_data = input.bind_data->Cast<OpenzlPromoteBindData>();
 	auto state = make_uniq<OpenzlPromoteGlobalState>();
 	state->con = make_uniq<Connection>(DatabaseInstance::GetDatabase(context));
-	state->result = state->con->SendQuery(bind_data.select_sql);
-	if (state->result->HasError()) {
-		throw IOException("openzl_promote: %s", state->result->GetError());
+	auto submitted = state->con->Submit(bind_data.select_sql);
+	if (submitted->HasError()) {
+		throw IOException("openzl_promote: %s", submitted->GetError());
 	}
+	state->stream = make_uniq<QueryResultStream>(std::move(submitted));
 	return std::move(state);
 }
 
 static void OpenzlPromoteFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<OpenzlPromoteGlobalState>();
-	auto chunk = state.result->Fetch();
-	if (state.result->HasError()) {
-		throw IOException("openzl_promote: %s", state.result->GetError());
-	}
+	auto chunk = state.stream->Fetch(); // throws on an execution error
 	if (!chunk || chunk->size() == 0) {
 		output.SetCardinality(0);
 		return;
@@ -623,7 +623,7 @@ static TableFunction GetOpenzlPromoteFunction() {
 // L, '0')`), restoring e.g. '093000123456789' from 93000123456789. Other columns pass through unchanged. Only use it on
 // data that was written with fixed_width promotion: a genuine DECIMAL(L,0) column would be padded too.
 static unique_ptr<FunctionData> OpenzlRestoreBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("openzl_restore: path must not be NULL");
 	}
@@ -659,8 +659,8 @@ static unique_ptr<FunctionData> OpenzlRestoreBind(ClientContext &context, TableF
 	if (schema->HasError()) {
 		throw IOException("openzl_restore: %s", schema->GetError());
 	}
-	return_types = schema->types;
-	names = schema->names;
+	return_types = schema->GetTypes();
+	names = schema->GetNames();
 	return std::move(result);
 }
 
@@ -759,7 +759,7 @@ struct OpenzlCopyLocalState : public LocalFunctionData {
 };
 
 static unique_ptr<FunctionData> OpenzlCopyBind(ClientContext &context, CopyFunctionBindInput &input,
-                                               const vector<string> &names, const vector<LogicalType> &sql_types) {
+                                               const vector<Identifier> &names, const vector<LogicalType> &sql_types) {
 	auto &parquet_entry =
 	    Catalog::GetEntry<CopyFunctionCatalogEntry>(context, SYSTEM_CATALOG, DEFAULT_SCHEMA, "parquet");
 
