@@ -398,12 +398,11 @@ static void OpenzlTrainFunction(ClientContext &context, TableFunctionInput &data
 }
 
 static TableFunction GetOpenzlTrainFunction() {
-	TableFunction function(
-	    "openzl_train",
-	    FunctionSignature()
-	        .AddPositionalOnly("sample_paths", LogicalType::LIST(LogicalType::VARCHAR))
-	        .AddPositionalOnly("output_path", LogicalType::VARCHAR),
-	    OpenzlTrainFunction, OpenzlTrainBind, OpenzlTrainInitGlobal);
+	TableFunction function("openzl_train",
+	                       FunctionSignature()
+	                           .AddPositionalOnly("sample_paths", LogicalType::LIST(LogicalType::VARCHAR))
+	                           .AddPositionalOnly("output_path", LogicalType::VARCHAR),
+	                       OpenzlTrainFunction, OpenzlTrainBind, OpenzlTrainInitGlobal);
 	// All keyword-only params default to a typed NULL rather than a hardcoded value: the bind
 	// function already does its own (sometimes context-dependent, e.g. compression_level's
 	// OpenzlDefaultCompressionLevel(context)) IsNull()-gated fallback via GetNamed*/find(), and
