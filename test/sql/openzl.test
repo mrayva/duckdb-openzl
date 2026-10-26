@@ -138,7 +138,7 @@ true
 statement error
 SELECT * FROM openzl_train('not_a_list.parquet', '__TEST_DIR__/x.compressor');
 ----
-No function matches
+can't be cast to the destination type VARCHAR[]
 
 statement error
 SELECT * FROM openzl_train(NULL::VARCHAR[], '__TEST_DIR__/x.compressor');

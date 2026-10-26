@@ -398,25 +398,35 @@ static void OpenzlTrainFunction(ClientContext &context, TableFunctionInput &data
 }
 
 static TableFunction GetOpenzlTrainFunction() {
-	TableFunction function("openzl_train", {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
-	                       OpenzlTrainFunction, OpenzlTrainBind, OpenzlTrainInitGlobal);
-	function.named_parameters["threads"] = LogicalType::BIGINT;
-	function.named_parameters["clustering_trainer"] = LogicalType::VARCHAR;
-	function.named_parameters["num_samples"] = LogicalType::BIGINT;
-	function.named_parameters["no_ace_successors"] = LogicalType::BOOLEAN;
-	function.named_parameters["no_clustering"] = LogicalType::BOOLEAN;
-	function.named_parameters["dict_training"] = LogicalType::BOOLEAN;
-	function.named_parameters["max_time_secs"] = LogicalType::BIGINT;
-	function.named_parameters["max_file_size_mb"] = LogicalType::BIGINT;
-	function.named_parameters["max_total_size_mb"] = LogicalType::BIGINT;
-	function.named_parameters["pareto_frontier"] = LogicalType::BOOLEAN;
-	function.named_parameters["max_num_candidates"] = LogicalType::BIGINT;
-	function.named_parameters["compression_level"] = LogicalType::BIGINT;
-	function.named_parameters["verbose"] = LogicalType::BOOLEAN;
-	function.named_parameters["format_version"] = LogicalType::BIGINT;
-	function.named_parameters["parquet_chunk_bytes"] = LogicalType::BIGINT;
-	function.named_parameters["benchmark"] = LogicalType::BOOLEAN;
-	function.named_parameters["benchmark_files"] = LogicalType::LIST(LogicalType::VARCHAR);
+	TableFunction function(
+	    "openzl_train",
+	    FunctionSignature()
+	        .AddPositionalOnly("sample_paths", LogicalType::LIST(LogicalType::VARCHAR))
+	        .AddPositionalOnly("output_path", LogicalType::VARCHAR),
+	    OpenzlTrainFunction, OpenzlTrainBind, OpenzlTrainInitGlobal);
+	// All keyword-only params default to a typed NULL rather than a hardcoded value: the bind
+	// function already does its own (sometimes context-dependent, e.g. compression_level's
+	// OpenzlDefaultCompressionLevel(context)) IsNull()-gated fallback via GetNamed*/find(), and
+	// DuckDB 2.0 requires an explicit default for a keyword-only param to be optional at all --
+	// unlike 1.x, omitting default_value here makes the param mandatory on every call.
+	function.GetSignature().AddKeywordOnly("threads", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	function.GetSignature().AddKeywordOnly("clustering_trainer", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
+	function.GetSignature().AddKeywordOnly("num_samples", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	function.GetSignature().AddKeywordOnly("no_ace_successors", LogicalType::BOOLEAN, Value(LogicalType::BOOLEAN));
+	function.GetSignature().AddKeywordOnly("no_clustering", LogicalType::BOOLEAN, Value(LogicalType::BOOLEAN));
+	function.GetSignature().AddKeywordOnly("dict_training", LogicalType::BOOLEAN, Value(LogicalType::BOOLEAN));
+	function.GetSignature().AddKeywordOnly("max_time_secs", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	function.GetSignature().AddKeywordOnly("max_file_size_mb", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	function.GetSignature().AddKeywordOnly("max_total_size_mb", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	function.GetSignature().AddKeywordOnly("pareto_frontier", LogicalType::BOOLEAN, Value(LogicalType::BOOLEAN));
+	function.GetSignature().AddKeywordOnly("max_num_candidates", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	function.GetSignature().AddKeywordOnly("compression_level", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	function.GetSignature().AddKeywordOnly("verbose", LogicalType::BOOLEAN, Value(LogicalType::BOOLEAN));
+	function.GetSignature().AddKeywordOnly("format_version", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	function.GetSignature().AddKeywordOnly("parquet_chunk_bytes", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	function.GetSignature().AddKeywordOnly("benchmark", LogicalType::BOOLEAN, Value(LogicalType::BOOLEAN));
+	function.GetSignature().AddKeywordOnly("benchmark_files", LogicalType::LIST(LogicalType::VARCHAR),
+	                                       Value(LogicalType::LIST(LogicalType::VARCHAR)));
 	return function;
 }
 
@@ -484,9 +494,9 @@ static unique_ptr<FunctionData> OpenzlPromoteBind(ClientContext &context, TableF
 	}
 	vector<string> col_names;
 	vector<bool> is_varchar;
-	for (idx_t i = 0; i < desc->RowCount(); i++) {
-		col_names.push_back(desc->GetValue(0, i).ToString());
-		is_varchar.push_back(desc->GetValue(1, i).ToString() == "VARCHAR");
+	for (auto &row : *desc) {
+		col_names.push_back(row.GetBaseValue(0).ToString());
+		is_varchar.push_back(row.GetBaseValue(1).ToString() == "VARCHAR");
 	}
 
 	string int_re = "(0|-?[1-9][0-9]{0," + std::to_string(max_int_digits - 1) + "})";
@@ -522,20 +532,21 @@ static unique_ptr<FunctionData> OpenzlPromoteBind(ClientContext &context, TableF
 			throw IOException("openzl_promote: analysis of '%s' failed: %s", table, stats->GetError());
 		}
 		const idx_t stride = fixed_width ? 6 : 3;
+		auto stats_row = *stats->begin();
 		for (idx_t k = 0; k < agg_col.size(); k++) {
 			idx_t i = agg_col[k];
-			auto nonnull = stats->GetValue(stride * k, 0);
+			auto nonnull = stats_row.GetBaseValue(stride * k);
 			if (nonnull.IsNull() || nonnull.GetValue<int64_t>() == 0) {
 				continue;
 			}
-			auto all_int = stats->GetValue(stride * k + 1, 0);
-			auto all_dec = stats->GetValue(stride * k + 2, 0);
+			auto all_int = stats_row.GetBaseValue(stride * k + 1);
+			auto all_dec = stats_row.GetBaseValue(stride * k + 2);
 			bool digits_fixed = false;
 			int64_t width = 0;
 			if (fixed_width) {
-				auto all_digits = stats->GetValue(stride * k + 3, 0);
-				auto min_len = stats->GetValue(stride * k + 4, 0);
-				auto max_len = stats->GetValue(stride * k + 5, 0);
+				auto all_digits = stats_row.GetBaseValue(stride * k + 3);
+				auto min_len = stats_row.GetBaseValue(stride * k + 4);
+				auto max_len = stats_row.GetBaseValue(stride * k + 5);
 				if (!all_digits.IsNull() && all_digits.GetValue<bool>() && !min_len.IsNull() && !max_len.IsNull() &&
 				    min_len.GetValue<int64_t>() == max_len.GetValue<int64_t>()) {
 					width = min_len.GetValue<int64_t>();
@@ -576,7 +587,7 @@ static unique_ptr<FunctionData> OpenzlPromoteBind(ClientContext &context, TableF
 
 struct OpenzlPromoteGlobalState : public GlobalTableFunctionState {
 	unique_ptr<Connection> con;
-	unique_ptr<QueryResultStream> stream;
+	unique_ptr<QueryResult> stream;
 	idx_t MaxThreads() const override {
 		return 1;
 	}
@@ -587,17 +598,16 @@ static unique_ptr<GlobalTableFunctionState> OpenzlPromoteInitGlobal(ClientContex
 	auto &bind_data = input.bind_data->Cast<OpenzlPromoteBindData>();
 	auto state = make_uniq<OpenzlPromoteGlobalState>();
 	state->con = make_uniq<Connection>(DatabaseInstance::GetDatabase(context));
-	auto submitted = state->con->Submit(bind_data.select_sql);
-	if (submitted->HasError()) {
-		throw IOException("openzl_promote: %s", submitted->GetError());
+	state->stream = state->con->Submit(bind_data.select_sql);
+	if (state->stream->HasError()) {
+		throw IOException("openzl_promote: %s", state->stream->GetError());
 	}
-	state->stream = make_uniq<QueryResultStream>(std::move(submitted));
 	return std::move(state);
 }
 
 static void OpenzlPromoteFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<OpenzlPromoteGlobalState>();
-	auto chunk = state.stream->Fetch(); // throws on an execution error
+	auto chunk = state.stream->FetchRaw(); // throws on an execution error
 	if (!chunk || chunk->size() == 0) {
 		output.SetCardinality(0);
 		return;
@@ -608,11 +618,12 @@ static void OpenzlPromoteFunction(ClientContext &context, TableFunctionInput &da
 static TableFunction GetOpenzlPromoteFunction() {
 	TableFunction function("openzl_promote", {LogicalType::VARCHAR}, OpenzlPromoteFunction, OpenzlPromoteBind,
 	                       OpenzlPromoteInitGlobal);
-	function.named_parameters["max_int_digits"] = LogicalType::BIGINT;
-	function.named_parameters["decimal_int_digits"] = LogicalType::BIGINT;
-	function.named_parameters["decimal_scale"] = LogicalType::BIGINT;
-	function.named_parameters["promote_decimal"] = LogicalType::BOOLEAN;
-	function.named_parameters["fixed_width"] = LogicalType::BOOLEAN;
+	// See GetOpenzlTrainFunction() for why these default to a typed NULL rather than a literal.
+	function.GetSignature().AddKeywordOnly("max_int_digits", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	function.GetSignature().AddKeywordOnly("decimal_int_digits", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	function.GetSignature().AddKeywordOnly("decimal_scale", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	function.GetSignature().AddKeywordOnly("promote_decimal", LogicalType::BOOLEAN, Value(LogicalType::BOOLEAN));
+	function.GetSignature().AddKeywordOnly("fixed_width", LogicalType::BOOLEAN, Value(LogicalType::BOOLEAN));
 	return function;
 }
 
@@ -636,13 +647,15 @@ static unique_ptr<FunctionData> OpenzlRestoreBind(ClientContext &context, TableF
 	}
 	auto result = make_uniq<OpenzlPromoteBindData>();
 	string select_list;
-	for (idx_t i = 0; i < desc->RowCount(); i++) {
-		string name = desc->GetValue(0, i).ToString();
-		string type = desc->GetValue(1, i).ToString();
+	bool first = true;
+	for (auto &row : *desc) {
+		string name = row.GetBaseValue(0).ToString();
+		string type = row.GetBaseValue(1).ToString();
 		string c = OpenzlPromoteIdent(name);
-		if (i > 0) {
+		if (!first) {
 			select_list += ", ";
 		}
+		first = false;
 		int width = 0;
 		if (type.size() > 11 && type.compare(0, 8, "DECIMAL(") == 0 && type.compare(type.size() - 3, 3, ",0)") == 0) {
 			width = std::atoi(type.substr(8, type.size() - 11).c_str());
